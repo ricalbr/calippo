@@ -1,2 +1,2 @@
-# caluppo
-Calibration of UPPs
+# calippo
+CALIbration of Photonics PrOcessors
