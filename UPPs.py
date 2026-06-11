@@ -451,26 +451,3 @@ def importEphosCalibration(UPPobject: Bell, fileName: str):
                                       
     UPPobject.Astored[(UPPobject.n*(UPPobject.n-1)**2):]=phi0
     
-
-def randomU(N):
-    """
-    Extracts a random unitary matrix of size N
-    using the internal function
-    sp.stats.unitary_group.rvs(N)
-    of the scipy module.
-    """
-    return sp.stats.unitary_group.rvs(N)
-
-def makeRealBorder(W):
-    """
-    Takes a unitary matrix W and makes it     "real-bordered". Namely, 
-    it calculates the diagonal unitaries Dleft and Dright such that
-    R = Dleft @ W @ Dright has all real elements on he first row and first 
-    column. Elements of the first row and first column of W must
-    be non-vanishing. The function returns R, Dleft, Dright.
-    """
-    Dright=np.diag(W[0,:].conj()/np.abs(W[0,:]))
-    W1 = W @ Dright
-    Dleft=np.diag(W1[:,0].conj()/np.abs(W1[:,0]))
-    return Dleft @ W1, Dleft, Dright
-        

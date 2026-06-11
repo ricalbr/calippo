@@ -3,13 +3,13 @@
 """
 Created on Sat Nov  8 12:07:46 2025
 
-@author: francescoceccarelli
+@author: Francesco Ceccarelli, Andrea Crespi
 
-Utilities for UPP calibration/test.
+Utilities and helpers for UPP calibration/operation.
 
 This module provides utility functions for measuring and processing unitaries
 on a Universal Photonic Processor (UPP), including Sinkhorn normalization,
-fidelity metrics and random unitary generation.
+fidelity metrics, random unitary generation and other.
 
 Functions
 ---------
@@ -19,6 +19,8 @@ amplitude_fidelity(U_target, U_exp)
     Calculate fidelity based on the magnitude of matrix elements.
 fidelity(U_target, U_exp)
     Calculate the standard fidelity for complex unitaries.
+make_real_border(U)
+    Make a unitary matrix "real-bordered" by zeroing angles on 1st row/col.
 get_haar_unitary(size)
     Generate a complex random Haar-distributed unitary matrix.
 """
@@ -155,6 +157,36 @@ def fidelity(U_target: np.ndarray, U_exp: np.ndarray) -> float:
     return float(np.abs(overlap) / N)
 
 
+def make_real_border(U: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Make a unitary matrix "real-bordered".
+
+    Calculates the diagonal unitaries Dleft and Dright such that
+    R = Dleft @ U @ Dright has entirely real elements on its first row 
+    and first column. The elements of the first row and first column 
+    of the input matrix U must be non-vanishing.
+
+    Parameters
+    ----------
+    U : np.ndarray, shape (N, N)
+        The input unitary matrix to be modified.
+
+    Returns
+    -------
+    R : np.ndarray
+        The real-bordered unitary matrix.
+    Dleft : np.ndarray
+        The left diagonal unitary correction matrix.
+    Dright : np.ndarray
+        The right diagonal unitary correction matrix.
+    """
+    Dright = np.diag(U[0, :].conj() / np.abs(U[0, :]))
+    U1 = U @ Dright
+    Dleft = np.diag(U1[:, 0].conj() / np.abs(U1[:, 0]))
+    
+    return Dleft @ U1, Dleft, Dright
+
+
 def get_haar_unitary(size: int) -> np.ndarray:
     """
     Generate a random unitary matrix sampled from the Haar measure.
@@ -205,6 +237,18 @@ if __name__ == "__main__":
         print(f"Noise Intensity:    {noise_intensity}")
         print(f"Fidelity:           {fid:.5f}")
         print(f"Amplitude Fidelity: {fid_amp:.5f}")
+        
+        # 6. Test make_real_border
+        R, Dleft, Dright = make_real_border(U_target)
+
+        # Calculate the sum of the absolute imaginary parts on the first row and column
+        # If the function works correctly, these values should be extremely close to 0
+        imag_sum_row = np.sum(np.abs(np.imag(R[0, :])))
+        imag_sum_col = np.sum(np.abs(np.imag(R[:, 0])))
+        
+        print("\n--- Real Border Test ---")
+        print(f"Residual imaginary sum (1st row): {imag_sum_row:.2e}")
+        print(f"Residual imaginary sum (1st col): {imag_sum_col:.2e}")
         
     except Exception as e:
         print(f"An error occurred: {e}.")
