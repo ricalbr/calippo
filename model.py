@@ -35,6 +35,7 @@ import matplotlib.pyplot as plt
 import time
 import pickle
 from abc import ABC, abstractmethod
+from .tools import fidelity, amplitude_fidelity
 
 ###############################################################################
 #                           BASE ABSTRACT CLASS                               #
@@ -82,13 +83,21 @@ class Mesh(ABC):
     def calibrateUPP(self, setOfUAmpl, I2, A0):
         pass
 
-    @abstractmethod
     def amplitudeFidelityWith(self, Uref):
-        pass
-
-    @abstractmethod
+        """
+        Calculates the mean amplitude fidelity between the set of unitaries 
+        stored in the object and a set of unitaries of reference Uref.
+        """
+        fids = amplitude_fidelity(Uref, self.U)
+        return np.mean(fids)
+    
     def fidelityWith(self, Uref):
-        pass
+        """
+        Calculates the mean fidelity between the set of unitaries 
+        stored in the object and a set of unitaries of reference Uref.
+        """
+        fids = fidelity(Uref, self.U)
+        return np.mean(fids)
 
 
 ###############################################################################
@@ -100,7 +109,6 @@ class Clements(Mesh):
     A photonic processor built according to the Clements scheme.
     """
     def __init__(self, nModes, Refl=0.5):
-        # TODO: Implement initialization for Clements mesh
         pass
         
     def generateTestCoefficients(self, gain0, amplPhi0, noise0=None):
@@ -128,12 +136,6 @@ class Clements(Mesh):
         pass
 
     def calibrateUPP(self, setOfUAmpl, I2, A0):
-        pass
-
-    def amplitudeFidelityWith(self, Uref):
-        pass
-
-    def fidelityWith(self, Uref):
         pass
 
 
@@ -530,20 +532,6 @@ class Bell(Mesh):
         
         return Afit
 
-   
-    def amplitudeFidelityWith(self,Uref):
-        """
-        Calculates the mean amplitude fidelity between the set of unitaries 
-        stored in the object and a set of unitaries of reference Uref
-        """
-        return np.sum(np.abs(self.U*Uref))/self.n/self.nU
-    
-    def fidelityWith(self,Uref):
-        """
-        Calculates the mean fidelity between the set of unitaries 
-        stored in the object and a set of unitaries of reference Uref
-        """
-        return np.abs(np.sum(self.U*Uref.conj()))/self.n/self.nU
 
 ###############################################################################
 #                       OTHER USEFUL FUNCTIONS                                #

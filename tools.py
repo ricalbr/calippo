@@ -100,33 +100,31 @@ def sinkhorn(
     return U_work, D_in, D_out
 
 
-def amplitude_fidelity(U_target: np.ndarray, U_exp: np.ndarray) -> float:
+def amplitude_fidelity(U_target: np.ndarray, U_exp: np.ndarray) -> np.ndarray:
     """
     Calculate the amplitude fidelity between two complex matrices.
 
     This metric evaluates the similarity between the magnitudes of the 
     matrix elements, ignoring phase differences. It is useful when only 
-    power measurements are available.
-
+    power measurements are available. Supports single (N, N) or batch 
+    (M, N, N) matrices.
+    
     Parameters
     ----------
-    U_target : np.ndarray
-        The ideal or target unitary matrix.
-    U_exp : np.ndarray
-        The experimental or measured matrix.
+    U_target : np.ndarray, shape (N, N) or (M, N, N)
+        The ideal or target unitary matrix (or batch of matrices).
+    U_exp : np.ndarray, shape (N, N) or (M, N, N)
+        The experimental or measured matrix (or batch of matrices).
 
     Returns
     -------
-    float
-        Amplitude fidelity value between 0 and 1.
+    np.ndarray
+        Amplitude fidelity values between 0 and 1 (scalar or array of shape (M,)).
     """
-    abs_target = np.abs(U_target)
-    abs_exp = np.abs(U_exp)
-    
-    return fidelity(abs_target, abs_exp)
+    return fidelity(np.abs(U_target), np.abs(U_exp))
 
 
-def fidelity(U_target: np.ndarray, U_exp: np.ndarray) -> float:
+def fidelity(U_target: np.ndarray, U_exp: np.ndarray) -> np.ndarray:
     """
     Calculate the fidelity between two complex unitary matrices.
 
@@ -136,25 +134,28 @@ def fidelity(U_target: np.ndarray, U_exp: np.ndarray) -> float:
         F = |Tr(U_target^H @ U_exp)| / N.
     
     This metric is sensitive to relative phases but invariant to a 
-    global phase shift.
-
+    global phase shift. Supports both single (N, N) and batch (M, N, N) 
+    matrices.
+    
     Parameters
     ----------
-    U_target : np.ndarray, shape (N, N)
-        The ideal or target unitary matrix.
-    U_exp : np.ndarray, shape (N, N)
-        The experimental or measured matrix.
+    U_target : np.ndarray, shape (N, N) or (M, N, N)
+        The ideal or target unitary matrix (or batch of matrices).
+    U_exp : np.ndarray, shape (N, N) or (M, N, N)
+        The experimental or measured matrix (or batch of matrices).
 
     Returns
     -------
-    float
-        Fidelity value between 0 and 1.
+    np.ndarray
+        Fidelity values between 0 and 1 (scalar or array of shape (M,)).
     """
     N = U_target.shape[-1]
-    # Calculate Tr(U_target.H @ U_exp)
-    overlap = np.trace(np.dot(U_target.conj().T, U_exp))
     
-    return float(np.abs(overlap) / N)
+    # Calcolo dell'overlap (batch o singolo)
+    overlap = np.sum(U_target.conj() * U_exp, axis=(-2, -1))
+    
+    # Restituisce l'array delle fedeltà
+    return np.abs(overlap) / N
 
 
 def make_real_border(U: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
