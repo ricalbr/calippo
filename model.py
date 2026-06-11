@@ -1,13 +1,32 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-This module defines an object implementing a photonic processor
-built according to a sequence of mixing and phase layers.
-Multiple instances are supported in parallel, namely multiple
-configurations of phases can be calculated together.
+Created on Thu Jun 11 16:07:49 2026
 
-A. Crespi - F. Ceccarelli
+@author: Andrea Crespi, Francesco Ceccarelli
 
+Digital twin models for Universal Photonic Processors (UPP).
+
+This module defines objects implementing a photonic processor built 
+according to a sequence of mixing and phase layers. Multiple instances 
+are supported in parallel, namely multiple configurations of phases 
+can be calculated together.
+
+Classes
+-------
+Mesh
+    Abstract base class defining the standard mesh for UPP digital twins.
+Clements
+    A photonic processor built according to Clements et al. Optica 3.12
+    (2016): 1460-1465.
+Bell
+    A photonic processor built according to Bell et al. APL Photonics 6.7
+    (2021).
+
+Functions
+---------
+importEphosCalibration(UPPobject, fileName)
+    Import calibration data from a pickle file.
 """
 
 import numpy as np
@@ -15,13 +34,114 @@ import scipy as sp
 import matplotlib.pyplot as plt
 import time
 import pickle
+from abc import ABC, abstractmethod
+
+###############################################################################
+#                           BASE ABSTRACT CLASS                               #
+###############################################################################
+
+class Mesh(ABC):
+    """
+    Abstract base class for Universal Photonic Processors.
+    It defines the common interface that all mesh topologies must implement.
+    """
+
+    @abstractmethod
+    def generateTestCoefficients(self, gain0, amplPhi0, noise0=None):
+        pass
+
+    @abstractmethod
+    def generateRandomCurrents(self, nU_temp):
+        pass
+
+    @abstractmethod
+    def calcU(self):
+        pass
+
+    @abstractmethod
+    def phasesFromCurrAndA(self, I2, A):
+        pass
+
+    @abstractmethod
+    def phasesFromCurrents(self, I2):
+        pass
+
+    @abstractmethod
+    def currentsFromPhases(self):
+        pass
+
+    @abstractmethod
+    def setThesePhases(self, phi_full):
+        pass
+
+    @abstractmethod
+    def phasesFromU(self, Utarget, maxIter=100000, tarInf=1e-10, plotGraph=False):
+        pass
+
+    @abstractmethod
+    def calibrateUPP(self, setOfUAmpl, I2, A0):
+        pass
+
+    @abstractmethod
+    def amplitudeFidelityWith(self, Uref):
+        pass
+
+    @abstractmethod
+    def fidelityWith(self, Uref):
+        pass
+
+
+###############################################################################
+#                               CLASS CLEMENTS                                #
+###############################################################################
+ 
+class Clements(Mesh):
+    """
+    A photonic processor built according to the Clements scheme.
+    """
+    def __init__(self, nModes, Refl=0.5):
+        # TODO: Implement initialization for Clements mesh
+        pass
+        
+    def generateTestCoefficients(self, gain0, amplPhi0, noise0=None):
+        pass
+
+    def generateRandomCurrents(self, nU_temp):
+        pass
+
+    def calcU(self):
+        pass
+
+    def phasesFromCurrAndA(self, I2, A):
+        pass
+
+    def phasesFromCurrents(self, I2):
+        pass
+
+    def currentsFromPhases(self):
+        pass
+
+    def setThesePhases(self, phi_full):
+        pass
+
+    def phasesFromU(self, Utarget, maxIter=100000, tarInf=1e-10, plotGraph=False):
+        pass
+
+    def calibrateUPP(self, setOfUAmpl, I2, A0):
+        pass
+
+    def amplitudeFidelityWith(self, Uref):
+        pass
+
+    def fidelityWith(self, Uref):
+        pass
 
 
 ###############################################################################
 #                               CLASS BELL                                    #
 ###############################################################################
  
-class Bell():
+class Bell(Mesh):
     """
     A photonic processor built according to the Bell scheme.
     The number of modes can be specified (it must be EVEN in this version). 
@@ -31,7 +151,7 @@ class Bell():
     a subset of the available phase terms.
     
     """
-    def __init__(self,nModes, Refl=0.5):
+    def __init__(self, nModes, Refl=0.5):
         """
         The initialization method of the class. One can specify the number of 
         modes (nModes, needed parameter) and the power reflectivity of the 
@@ -57,7 +177,7 @@ class Bell():
         self.nPhases=self.n*(self.n-1)
         self.phi=np.zeros((self.nU,self.nPhases))
 
-        #NOW WE CALCULATE THE MIXING LAYERS       
+        #NOW WE CALCULATE THE MIXING LAYERS        
         #matrix of two-mode beam splitter, which is the basic block
         Trasm=1-Refl
         BS = np.array([[np.sqrt(Trasm), 1j*np.sqrt(Refl)],
@@ -99,7 +219,7 @@ class Bell():
         self.Pmask=self.Pmask.reshape(-1).astype('bool') #reshape into 1D array of bool
         #Mask for cross-talk coefficients
         self.Cmask=np.ones((self.n,self.n-1,self.n-1))  #We set a general framework of n layers with (n-1)x(n-1) coeff.
-        self.Cmask[0,:,:]=0	#In the first layer we act only on the even modes
+        self.Cmask[0,:,:]=0    #In the first layer we act only on the even modes
         self.Cmask[0,::2,::2]=1
         self.Cmask[-1,:,:]=0 #In the last layer we act only on the odd ones
         self.Cmask[-1,1::2,1::2]=1
@@ -200,9 +320,9 @@ class Bell():
         A is a 1D array with n*(n-1)^2+n*(n-1) elements; the first n*(n-1)^2 
         are cross-talks, the following n*(n-1) are phases at rest.
         """
-                   
+                    
         self.nU=I2.shape[0]
-      
+       
         #FIRST, reshaping
         I2 = I2.reshape(self.nU, self.n, self.n-1, 1)
         C=A[:(self.n*(self.n-1)**2)].reshape(1, self.n, self.n-1, self.n-1)
@@ -429,7 +549,7 @@ class Bell():
 #                       OTHER USEFUL FUNCTIONS                                #
 ###############################################################################
     
-def importEphosCalibration(UPPobject: Bell, fileName: str):
+def importEphosCalibration(UPPobject: Mesh, fileName: str):
     """
     Import calibration data from pickle file, formatted according to
     Ciro's conventions.
@@ -450,4 +570,3 @@ def importEphosCalibration(UPPobject: Bell, fileName: str):
                                       ii*(UPPobject.n-1):(ii+1)*(UPPobject.n-1) ].reshape(-1)
                                       
     UPPobject.Astored[(UPPobject.n*(UPPobject.n-1)**2):]=phi0
-    

@@ -3,7 +3,7 @@
 """
 Created on Wed Feb  3 23:05:56 2026
 
-@author: francescoceccarelli
+@author: Francesco Ceccarelli
 
 Control module for Universal Photonic Processors (UPP).
 
@@ -20,11 +20,14 @@ UniversalPhotonicProcessor
 import numpy as np
 from typing import List, Optional
 
-# Hardware and tool imports
+# Hardware imports
 from LfiberSwtich import FiberSwitch
 from SantecOPM150 import OPM150
 from Qontrol import Q8iv
-from .UPPtools import sinkhorn
+
+# UPP imports
+from .tools import sinkhorn
+from .model import Bell, Clements
 
 
 class UniversalPhotonicProcessor:
@@ -32,12 +35,16 @@ class UniversalPhotonicProcessor:
     Controller for a multi-mode Universal Photonic Processor (UPP).
 
     Integrates an Lfiber Switch, a Santec OPM150 and a Qontrol Q8iv driver
-    to provide full characterization of the photonic chip.
+    to provide full characterization of the photonic chip. It also initializes
+    a digital twin based on the specified mesh architecture.
 
     Parameters
     ----------
     num_modes : int
         Number of optical modes (dimension N).
+    mesh_type : str
+        Topology of the photonic mesh (e.g., 'bell', 'clements'). 
+        Used to instantiate the correct digital twin.
     wavelength_nm : int
         Operation wavelength in nanometers.
     imax : float
@@ -65,11 +72,16 @@ class UniversalPhotonicProcessor:
     ------
     ValueError
         If mapping lists do not match expectations.
+    ValueError
+        If an unsupported mesh type is provided.
     """
+
+    _MESHES_ = {'clements': Clements, 'bell': Bell}
 
     def __init__(
         self, 
         num_modes: int,
+        mesh_type: str,
         wavelength_nm: int,
         imax: float,
         vmax: float,
@@ -83,6 +95,12 @@ class UniversalPhotonicProcessor:
         verbose: bool = True
     ):
         self.num_modes = num_modes
+        
+        # Input validation for MZI mesh type
+        if mesh_type.lower() not in self._MESHES_:
+            raise ValueError(f"[UPP][ERROR] Unsupported mesh_type: '{mesh_type}'. Available options: {list(self._MESHES_.keys())}")
+        self.dtwin = self._MESHES_[mesh_type.lower()](num_modes)
+        
         self.imax = imax
         self.vmax = vmax
         self.verbose = verbose
@@ -93,11 +111,12 @@ class UniversalPhotonicProcessor:
         self.input_map = switch_channels if switch_channels else list(range(1, num_modes + 1))
         self.output_map = opm_channels if opm_channels else list(range(1, num_modes + 1))
         self.shifter_map = shifter_channels if shifter_channels else list(range(0, num_modes*(num_modes-1)))
+        
         if len(self.input_map) != num_modes or len(self.output_map) != num_modes:
             raise ValueError("[UPP][ERROR] Optical mapping lists must match number of modes N.")
         if len(self.shifter_map) != num_modes*(num_modes-1):
             raise ValueError("[UPP][ERROR] Electrical mapping lists must match number of shifters N(N-1).")
-        
+            
         # Initialize Hardware 1 & 2: Fiber Switch and Power Meter (Optional)
         if switch_resource:
             self.switch = FiberSwitch(switch_resource, transient=self.switch_transient, verbose=verbose)
