@@ -22,11 +22,6 @@ Clements
 Bell
     A photonic processor built according to Bell et al. APL Photonics 6.7
     (2021).
-
-Functions
----------
-importEphosCalibration(UPPobject, fileName)
-    Import calibration data from a pickle file.
 """
 
 import numpy as np
@@ -35,7 +30,8 @@ import matplotlib.pyplot as plt
 import time
 import pickle
 from abc import ABC, abstractmethod
-from .tools import fidelity, amplitude_fidelity
+from typing import Tuple, Optional
+
 
 ###############################################################################
 #                           BASE ABSTRACT CLASS                               #
@@ -43,61 +39,232 @@ from .tools import fidelity, amplitude_fidelity
 
 class Mesh(ABC):
     """
-    Abstract base class for Universal Photonic Processors.
+    Abstract base class for UPP meshes.
     It defines the common interface that all mesh topologies must implement.
-    """
-
-    @abstractmethod
-    def generateTestCoefficients(self, gain0, amplPhi0, noise0=None):
-        pass
-
-    @abstractmethod
-    def generateRandomCurrents(self, nU_temp):
-        pass
-
-    @abstractmethod
-    def calcU(self):
-        pass
-
-    @abstractmethod
-    def phasesFromCurrAndA(self, I2, A):
-        pass
-
-    @abstractmethod
-    def phasesFromCurrents(self, I2):
-        pass
-
-    @abstractmethod
-    def currentsFromPhases(self):
-        pass
-
-    @abstractmethod
-    def setThesePhases(self, phi_full):
-        pass
-
-    @abstractmethod
-    def phasesFromU(self, Utarget, maxIter=100000, tarInf=1e-10, plotGraph=False):
-        pass
-
-    @abstractmethod
-    def calibrateUPP(self, setOfUAmpl, I2, A0):
-        pass
-
-    def amplitudeFidelityWith(self, Uref):
-        """
-        Calculates the mean amplitude fidelity between the set of unitaries 
-        stored in the object and a set of unitaries of reference Uref.
-        """
-        fids = amplitude_fidelity(Uref, self.U)
-        return np.mean(fids)
     
-    def fidelityWith(self, Uref):
+    Parameters
+    ----------
+    n_modes : int
+        Number of optical modes (must be even in this version).
+    calibration_file : str, optional
+        Path to a pickle file containing the hardware calibration data.
+        If None, a random calibration is generated.
+    """
+    def __init__(self, n_modes: int, calibration_file: Optional[str] = None) -> None:
+
+        if n_modes % 2 != 0:
+            n_modes -= 1
+            print("Modes must be EVEN for this version.")
+            print(f"We shall take {n_modes} modes.")
+            
+        self.n_modes: int = n_modes                                  # Number of modes
+        self.n_phases: int = (n_modes - 1) * n_modes                 # Number of tunable parameters
+        self.n_used_phases: int = (n_modes - 1) * (n_modes - 1)      # Number of tunable parameters actually used in the experiments
+                        
+        # This part builds the specific topology of the mesh (implemented by children)
+        self.static_phases_mask, self.xtalk_mask = self._generate_masks()    # Masks that relate the used calibration parameters to the available ones 
+        self.n_mixing_layers, self.M = self._generate_mixing_layers()        # Mode mixing implemented by directional couplers layers
+
+        # This part populates xtalk (rad/mA2) and static phases (rad)
+        if calibration_file is not None:
+            self.static_phases, self.xtalk = self.import_calibration(calibration_file)
+        else:
+            self.static_phases, self.xtalk = self.generate_random_calibration(1.0, 2 * np.pi) 
+
+        # Output
+        print("A new processor was created.")
+        print(f"This has {self.n_modes} modes, {self.n_phases} tunable phases.")
+        print(f"Only {self.n_used_phases} phases are actually used.")
+        print()
+    
+    
+    @abstractmethod
+    def _generate_masks(self) -> Tuple[np.ndarray, np.ndarray]:
+        pass
+
+
+    @abstractmethod
+    def _generate_mixing_layers(self) -> Tuple[int, np.ndarray]:
+        pass
+
+
+    def import_calibration(self, fileName: str) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Calculates the mean fidelity between the set of unitaries 
-        stored in the object and a set of unitaries of reference Uref.
+        Import calibration data from a pickle file.
+
+        Parameters
+        ----------
+        fileName : str
+            Path to the pickle file containing 'static_phases', 
+            'xt_matrix', and 'n_heaters'.
+
+        Returns
+        -------
+        tuple of np.ndarray
+            The static phases array (rad) and the cross-talk matrix (rad/mA2).
+
+        Raises
+        ------
+        ValueError
+            If the number of modes or phases in the calibration file 
+            does not match the processor architecture.
         """
-        fids = fidelity(Uref, self.U)
-        return np.mean(fids)
+        with open(fileName, 'rb') as f:
+            calibration = pickle.load(f)
+
+        if calibration['N'] != self.n_modes:
+            raise ValueError(f"Calibration size mismatch: expected {self.n_modes} modes, "
+                             f"found {calibration['N']}.")
+            
+        if calibration['n_heaters'] != self.n_phases:
+            raise ValueError(f"Calibration size mismatch: expected {self.n_phases} phases, "
+                             f"found {calibration['n_heaters']}.")
+
+        static_phases = np.mod(calibration['static_phases'], 2 * np.pi)
+        static_phases = static_phases * self.static_phases_mask
+        xtalk = calibration['xt_matrix']
+        xtalk = xtalk * self.xtalk_mask
+
+        return static_phases, xtalk
+        
+
+    def generate_random_calibration(self, xtalk_ampl: float, static_phases_ampl: float, noise: Optional[float] = None) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Generate a random calibration matrix for simulation purposes.
+        
+        On average, current-squared-to-phase gain is driven by `xtalk_ampl`, 
+        and cross-talks are close to 0. Phases at rest are randomly distributed.
+
+        Parameters
+        ----------
+        xtalk_ampl : float
+            Average current-squared to phase gain (diagonal of the matrix) in rad/mA2.
+        static_phases_ampl : float
+            Amplitude for initial random static phase distribution in rad.
+        noise : float, optional
+            Noise amount on both diagonal and cross-talks. If None, defaults to xtalk_ampl/10.
+
+        Returns
+        -------
+        tuple of np.ndarray
+            An array of static phases (rad) and the cross-talk matrix (rad/mA2).
+        """
+        if noise is None:
+            noise = xtalk_ampl / 10.0
+            
+        static_phases = np.mod(np.random.rand(self.n_phases) * static_phases_ampl, 2 * np.pi)
+        static_phases = static_phases * self.static_phases_mask
+        xtalk = np.eye(self.n_phases) * xtalk_ampl + (np.random.rand(self.n_phases, self.n_phases) - 0.5) * noise
+        xtalk = xtalk * self.xtalk_mask
+
+        return static_phases, xtalk
+
+
+    def generate_random_currents(self, current_ampl: float) -> np.ndarray:
+        """
+        Generate a 1D array of random currents in mA.
+        
+        The square of the output is uniformly distributed between 0 and 1,
+        then scaled by the provided maximum amplitude. Unused phases according
+        to the internal mask are strictly kept at zero.
+
+        Parameters
+        ----------
+        current_ampl : float
+            Maximum current amplitude in mA.
+
+        Returns
+        -------
+        np.ndarray
+            Array of shape (n_phases,) with randomized currents in mA.
+        """
+        I = np.sqrt(np.random.rand(self.n_phases)) * current_ampl
+        I *= self.static_phases_mask
+        return I
+
+
+    def phases_from_currents(self, currents: np.ndarray) -> np.ndarray:
+        """
+        Calculate the optical phases for a 1D vector of currents based on the 
+        cross-talk coefficients stored internally.
+
+        Parameters
+        ----------
+        currents : np.ndarray
+            1D array of currents of shape (n_phases,) in mA.
+
+        Returns
+        -------
+        np.ndarray
+            Array of calculated phases in rad.
+        """
+        # Input validation
+        currents = np.squeeze(currents)
+        if currents.size != self.n_phases:
+            raise ValueError(
+                f"Dimension mismatch: expected {self.n_phases} elements, "
+                f"but 'currents' has size {currents.size}."
+            )
+            
+        # Calculate phases
+        phases = self.static_phases + self.xtalk @ currents ** 2
+        return np.mod(phases, 2 * np.pi)
+    
+
+    @abstractmethod
+    def U_from_phases(self, phases: np.ndarray) -> np.ndarray:
+        pass
+        
+    
+    def currents_from_phases(self, phases: np.ndarray) -> np.ndarray:
+        """
+        Calculate the currents in mA required to achieve target optical phases,
+        compensating for cross-talk using the calibration matrix. 
+        
+        The method solves the linear system for squared currents and iteratively 
+        adjusts phases by 2*pi if negative squared currents are found.
+
+        Parameters
+        ----------
+        phases : np.ndarray
+            1D array of target phase values in rad.
+
+        Returns
+        -------
+        np.ndarray
+            1D array of currents in mA.
+        """
+        # Input validation
+        phases= np.mod(phases, 2 * np.pi)
+        phases = np.squeeze(phases)
+        if phases.size != self.n_phases:
+            raise ValueError(
+                f"Dimension mismatch: expected {self.n_phases} elements, "
+                f"but 'phases' has size {phases.size}."
+            )
+
+        # Reduce dimensions to used parameters in order to avoid singularities
+        phases = phases[self.static_phases_mask]
+        static_phases = self.static_phases[self.static_phases_mask]
+        used_rows = np.any(self.xtalk_mask, axis=0)
+        xtalk = self.xtalk[np.ix_(used_rows, used_rows)]
+
+        # Numerical inversion
+        I2 = np.linalg.solve(xtalk, phases - static_phases)
+        while np.any(I2 < 0):
+            phases[I2 < 0] += 2 * np.pi
+            I2 = np.linalg.solve(xtalk, phases - static_phases)
+        
+        # Reconstruct original dimensions
+        I = np.zeros_like(self.static_phases_mask, dtype=float)
+        I[self.static_phases_mask] = np.sqrt(I2)
+        
+        return I
+
+
+    @abstractmethod
+    def phases_from_U(self, U_target: np.ndarray, max_iter: int = 100000, target_infidelity: float = 1e-5, plot_graph: bool = False) -> np.ndarray:
+        pass
 
 
 ###############################################################################
@@ -108,34 +275,19 @@ class Clements(Mesh):
     """
     A photonic processor built according to the Clements scheme.
     """
-    def __init__(self, nModes, Refl=0.5):
+    def _generate_masks(self) -> Tuple[np.ndarray, np.ndarray]:
+        pass
+    
+
+    def _generate_mixing_layers(self) -> Tuple[int, np.ndarray]:
         pass
         
-    def generateTestCoefficients(self, gain0, amplPhi0, noise0=None):
+    
+    def U_from_phases(self, phases: np.ndarray) -> np.ndarray:
         pass
 
-    def generateRandomCurrents(self, nU_temp):
-        pass
 
-    def calcU(self):
-        pass
-
-    def phasesFromCurrAndA(self, I2, A):
-        pass
-
-    def phasesFromCurrents(self, I2):
-        pass
-
-    def currentsFromPhases(self):
-        pass
-
-    def setThesePhases(self, phi_full):
-        pass
-
-    def phasesFromU(self, Utarget, maxIter=100000, tarInf=1e-10, plotGraph=False):
-        pass
-
-    def calibrateUPP(self, setOfUAmpl, I2, A0):
+    def phases_from_U(self, U_target: np.ndarray, max_iter: int = 100000, target_infidelity: float = 1e-5, plot_graph: bool = False) -> np.ndarray:        
         pass
 
 
@@ -146,415 +298,283 @@ class Clements(Mesh):
 class Bell(Mesh):
     """
     A photonic processor built according to the Bell scheme.
+
     The number of modes can be specified (it must be EVEN in this version). 
     Multiple configurations of phases can be calculated at the same time.
     Thermo-optic phase actuation is also considered in the terms of 
     squared currents applied to phase-shifters; phase-shifters are present for
     a subset of the available phase terms.
     
+    Parameters
+    ----------
+    n_modes : int
+        Number of modes (must be even).
+    refl : float, optional
+        Power reflectivity of the basic beam splitter. Default is 0.5.
     """
-    def __init__(self, nModes, Refl=0.5):
+    def _generate_masks(self) -> Tuple[np.ndarray, np.ndarray]:
         """
-        The initialization method of the class. One can specify the number of 
-        modes (nModes, needed parameter) and the power reflectivity of the 
-        basic beam splitter (Refl, optional parameter). If the power reflectivity
-        is not specified, Refl = 1/2 is assumed.
-        Only EVEN number of modes are at present supported.
-        """
-        if nModes % 2 ==1:
-            nModes=nModes-1
-            print("Modes must be EVEN for this version.")
-            print(f"We shall take {nModes} modes.")
-            
-        self.n=nModes #the number of modes must be defined
-        self.nM=self.n+1 #number of mixing layers (EXCLUDING the phase blocks)
-        
-        self.nU=1 #to begin with, we set the number of contained unitaries
-                    #equal to 1
-                    
+        Generate the boolean masks for the Bell architecture, specifying which 
+        phases and cross-talk elements are physically implemented.
 
-        #phi is the constitutive parameters that determines the built-in unitary
-        #it contains nU sets of n vectors of length n-1, i.e. an array nU x n(n-1)
-        #where nU is the number of unitaries to be calculated at the same time
-        self.nPhases=self.n*(self.n-1)
-        self.phi=np.zeros((self.nU,self.nPhases))
-
-        #NOW WE CALCULATE THE MIXING LAYERS        
-        #matrix of two-mode beam splitter, which is the basic block
-        Trasm=1-Refl
-        BS = np.array([[np.sqrt(Trasm), 1j*np.sqrt(Refl)],
-                       [1j*np.sqrt(Refl), np.sqrt(Trasm)]])
-
-        #first kind of beam-splitter layer (V1)
-        V1=BS
-        for ii in range(1,int(self.n/2)):
-            V1=sp.linalg.block_diag(V1,BS)
-
-        #second kind of beam-splitter layer (V2)
-        V2=np.array([[1]]) 
-        for ii in range(1,int(self.n/2)):
-            V2=sp.linalg.block_diag(V2,BS)
-        V2=sp.linalg.block_diag(V2, np.array([[1]]) )
-
-        #array of matrices that describe the processor (mixing layers)
-        self.M=np.zeros((self.nM,self.n,self.n),dtype=complex)
-
-        for ii in range(1,self.nM,2):
-            self.M[ii-1,:,:]=V1@V2
-            self.M[ii,:,:]=V2@V1
-        self.M[0,:,:]=V1
-        self.M[self.n,:,:]=V2
-            
-        self.calcU() #Executes the method calcU() which calculates the unitaries
-                    #associated to phi and stores them in the object
-        
-        #NOW WE CALCULATE THE MASKS
-        #that relate the actual free parameters of calibration
-        #to the available ones
-
-        #Mask for phases and currents
-        self.Pmask=np.ones((self.n,self.n-1)) #we have n(n-1) overall phases
-        self.Pmask[0,:]=0        #In the first layer we act only on the even ones
-        self.Pmask[0,::2]=1
-        self.Pmask[-1,:]=0       #In the last layer we act only on the odd ones
-        self.Pmask[-1,1::2]=1
-        self.Pmask=self.Pmask.reshape(-1).astype('bool') #reshape into 1D array of bool
-        #Mask for cross-talk coefficients
-        self.Cmask=np.ones((self.n,self.n-1,self.n-1))  #We set a general framework of n layers with (n-1)x(n-1) coeff.
-        self.Cmask[0,:,:]=0    #In the first layer we act only on the even modes
-        self.Cmask[0,::2,::2]=1
-        self.Cmask[-1,:,:]=0 #In the last layer we act only on the odd ones
-        self.Cmask[-1,1::2,1::2]=1
-        self.Cmask=self.Cmask.reshape(-1).astype('bool') #reshape into 1D array of bool
-
-        self.Amask=np.concatenate((self.Cmask,self.Pmask))
-
-        self.nCurrents=np.sum(self.Pmask)
-        self.nTotCoeff=np.sum(self.Amask)
-        
-        #A set of cross-talk coefficients and phi0 
-        #is also stored in the processor; for initialization
-        #we use a trivial set.
-        self.Astored=self.generateTestCoefficients(1, 0, 0)
-        
-        
-        print("A new processor was created")
-        print(f"This has {self.n} modes, {self.nM} mixing layers, {self.nPhases} phases.")
-        print(f"However, only {self.nCurrents} phase terms are directly actuated by currents")
-        print(f"so the free parameters including cross-talks are {self.nTotCoeff}.")
-        print()
-        print("Used beam-splitter matrix")
-        print(BS)
-        print()
-        print()
-        
- 
-    
-    def generateTestCoefficients(self,gain0,amplPhi0,noise0=None):
+        Returns
+        -------
+        tuple of np.ndarray
+            A tuple containing (static_phases_mask, xtalk_mask).
         """
-        Returns a random array of coefficients A. On average, 
-        currentSquared-to-Phase is gain0, cross-talks equal to 0.
-        Noise is added on gains and cross-talks for an amount equal to
-        noise0. If noise0 is not specified, noise0=gain0/10 is taken.
-        Phases at rest are randomly distributed between 0 to amplPhi0.
-        """
-        if noise0==None:
-            noise0=gain0/10
-            
-        Cflatted=np.tile(np.eye(self.n-1). 
-                         reshape(-1) * gain0, self.n ) + np.random.rand(
-                             self.n*(self.n-1)**2)*noise0
-        phi0=np.random.rand(self.n*(self.n-1))*amplPhi0
-        Cflatted=Cflatted*self.Cmask #unrelevant coefficients set to zero
-        phi0=phi0*self.Pmask #unrelevant coefficients set to zero
+        # Mask for phases and currents that relate the actual free parameters of calibration to the available ones       
+        static_phases_mask = np.ones((self.n_modes, self.n_modes - 1)) # We have n(n-1) overall phases
+        static_phases_mask[0, :] = 0        # In the first layer we act only on the even ones
+        static_phases_mask[0, ::2] = 1
+        static_phases_mask[-1, :] = 0       # In the last layer we act only on the odd ones
+        static_phases_mask[-1, 1::2] = 1
+        static_phases_mask = static_phases_mask.reshape(-1).astype('bool') # Reshape into 1D array of bool
         
-        return np.hstack((Cflatted, phi0))
+        # Mask for cross-talk coefficients
+        xtalk_mask = np.ones((self.n_modes, self.n_modes - 1, self.n_modes - 1)) # We set a general framework of n layers with (n-1)x(n-1) coeff.
+        xtalk_mask[0, :, :] = 0     # In the first layer we act only on the even modes
+        xtalk_mask[0, ::2, ::2] = 1
+        xtalk_mask[-1, :, :] = 0    # In the last layer we act only on the odd ones
+        xtalk_mask[-1, 1::2, 1::2] = 1
+        xtalk_mask = sp.linalg.block_diag(*xtalk_mask) # Reshape into 2D array of bool
 
-    def generateRandomCurrents(self,nU_temp):
+        return static_phases_mask, xtalk_mask
+
+
+    def _generate_mixing_layers(self) -> Tuple[int, np.ndarray]:
         """
-        Generates an array consisting of nU vectors of random currents squared
-        between 0 and 1; the vector length is nPhases but only 
-        the relevant phases are non-zero.
-        
-        """                              #only to feed relevant phases
-        I2 = np.random.rand(nU_temp,self.nPhases)
-        I2 = I2*self.Pmask #only the relevant ones are kept
-        
-        return I2
-    
-    def calcU(self):
-       """
-       Carry on the calculation of the unitaries on the basis of the stored
-       phases phi. These unitaries are 3D array, namely a stack of matrices: 
-       first dimension is the index  of the unitary, then we have rows 
-       and columns. Unitaries are stored in the object as self.U.
-       Only n-1 phases per layer are considered; this is sufficiently general;
-       because it defines the unitary apart from a global phase term.
-       """
-       
-       self.U = np.tile(np.eye(self.n),(self.nU,1,1)) #prepares an array containing nU identity matrices, to start with
-       
-       for ii in range(self.nM-1): 
-    
-           self.U=self.M[ii,:,:] @ self.U #multiplication (row x column) of the next mixing layer
-           self.U[:,0:(self.n-1),:]=self.U[:,0:(self.n-1),:] * np.exp( 1j * self.phi[:, ii*(self.n-1):(ii+1)*(self.n-1)] )[:,:,np.newaxis] 
-           #Takes the relevant phase layer phi[:, ii*(n-1):(ii+1)*(n-1)]
-           # and adds a new dimension. 
-           #In this way the first dimension is the number of
-           # the unitary, the second is the row number, the third 
-           #is the column number (which here has size 1)
-           # Multiplication of U by this array (exploiting broadcasting) 
-           # means that each row is multiplied by the phase term. 
-           # The first mode is not multiplied by the phase.
-           
-       #last layer
-       self.U = self.M[self.nM-1,:,:] @ self.U
-    
-            
-    def phasesFromCurrAndA(self,I2,A):
+        Generate the static mixing layers (directional couplers) for the Bell 
+        architecture.
+
+        Returns
+        -------
+        tuple
+            A tuple containing the number of mixing layers (int) and 
+            the 3D array of matrices M (np.ndarray).
         """
-        Calculates phases from nU vectors of squared currents I2, 
-        given the cross-talk coefficients A. Stores the phases in the object
-        as self.phi.
+        n_mixing_layers = self.n_modes + 1  # Number of mixing layers (EXCLUDING the phase blocks)
+        refl = 0.5
+        trasm = 1.0 - refl
+        BS = np.array([[np.sqrt(trasm), 1j * np.sqrt(refl)],
+                       [1j * np.sqrt(refl), np.sqrt(trasm)]])
+
+        # First kind of beam-splitter layer (V1)
+        V1 = BS
+        for ii in range(1, self.n_modes // 2):
+            V1 = sp.linalg.block_diag(V1, BS)
+
+        # Second kind of beam-splitter layer (V2)
+        V2 = np.array([[1]]) 
+        for ii in range(1, self.n_modes // 2):
+            V2 = sp.linalg.block_diag(V2, BS)
+        V2 = sp.linalg.block_diag(V2, np.array([[1]]))
+
+        # Array of matrices that describe the processor (mixing layers)
+        M = np.zeros((n_mixing_layers, self.n_modes, self.n_modes), dtype=complex)
+
+        for ii in range(1, n_mixing_layers, 2):
+            M[ii - 1, :, :] = V1 @ V2
+            M[ii, :, :] = V2 @ V1
+        M[0, :, :] = V1
+        M[self.n_modes, :, :] = V2
         
-        I2 is an array with (nU,n(n-1)) entries, namely containing nU vectors 
-        of n(n-1) currents
-        A is a 1D array with n*(n-1)^2+n*(n-1) elements; the first n*(n-1)^2 
-        are cross-talks, the following n*(n-1) are phases at rest.
+        return n_mixing_layers, M 
+
+
+    def U_from_phases(self, phases: np.ndarray) -> np.ndarray:
         """
-                    
-        self.nU=I2.shape[0]
-       
-        #FIRST, reshaping
-        I2 = I2.reshape(self.nU, self.n, self.n-1, 1)
-        C=A[:(self.n*(self.n-1)**2)].reshape(1, self.n, self.n-1, self.n-1)
-        phi0=A[(self.n*(self.n-1)**2):].reshape(1, self.n, self.n-1, 1)
-        #NOW
-        #I2 is an array (nU,n,n-1,1) --- corresponding to nU sets of n vectors with n-1 values (ordered
-        #                           in such a way that each vector is a column)
-        #C is an array (1,n,n-1,n-1) --- corresponding to n matrices with (n-1)^2 elements (cross-talks
-        #               only considered among phases of the same column)
-        #phi0 is an array (1, n,n-1,1) --- corresponding to a set of n vectors with n-1 values
-        self.phi = (C @ I2 + phi0).reshape(self.nU,self.nPhases)
+        Calculate the 2D unitary matrix representation of the processor on the 
+        basis of the provided 1D phase array.
         
-    def phasesFromCurrents(self,I2):
+        Only n-1 phases per layer are considered; this is sufficiently general
+        because it defines the unitary apart from a global phase term.
+
+        Parameters
+        ----------
+        phases : np.ndarray
+            1D array of optical phases in rad.
+
+        Returns
+        -------
+        np.ndarray
+            The 2D complex unitary matrix resulting from the propagation.
         """
-        Calculates phases from nU vectors of squared currents I2, 
-        given the cross-talk coefficients stored in the UPP. Stores the phases in the object
-        as self.phi.
-        """
-        self.phasesFromCurrAndA(I2,self.Astored)
+        # Input validation
+        phases = np.squeeze(phases)
+        if phases.size != self.n_phases:
+            raise ValueError(
+                f"Dimension mismatch: expected {self.n_phases} elements, "
+                f"but 'phases' has size {phases.size}."
+            )
         
-    def currentsFromPhases(self):
-        """
-        Calculates the squared currents (I2) to achieve the
-        target optical phases phi stored in the object, compensating for thermal cross-talk
-        using the A coefficients stored in the object. (by Francesco Ceccarelli
-                                                        and Andrea Crespi)
-        """
-        
-        #Takes the coefficients from the object (self.Astored) and 
-        #reshape them into a block-diagonal matrix
-        Cmatrix=np.zeros((self.nPhases,self.nPhases))
-        for ii in range(self.n):
-                Cmatrix[ ii*(self.n-1):(ii+1)*(self.n-1), 
-                        ii*(self.n-1):(ii+1)*(self.n-1) ] = self.Astored[ 
-                    ii * (self.n-1)**2 : (ii+1) * (self.n-1)**2].reshape(
-                        self.n-1,self.n-1)
-        phi0=self.Astored[(self.n*(self.n-1)**2):]
-        
-        #Remove phases/heaters that are not actuated.
-        #active_indices = np.where(~np.all(Cmatrix == 0, axis=0))[0]
-        Cmatrix = Cmatrix[self.Pmask][:, self.Pmask]
-        phi0 = phi0[self.Pmask]
-        
-        
-        I2 = np.zeros_like(self.phi)
-        
-        for ii in range(self.phi.shape[0]): #self.phi may include more phase vectors
-            
-            phi = self.phi[ii,self.Pmask]
-        
-            #Calculates squared currents by numerical inversion.
-            J = np.linalg.solve(Cmatrix, phi - phi0)
-            while np.any(J < 0):
-                phi[J < 0] += 2 * np.pi
-                J = np.linalg.solve(Cmatrix, phi - phi0)
+        # Prepare an array containing the identity matrix
+        U = np.eye(self.n_modes, dtype=complex) 
                 
-            # Reconstructs final full vectors
-            I2[ii,self.Pmask] = J
-        
-        return I2
-
-    def setThesePhases(self,phi_full):
-        """
-        Set the internal phase stored in the object as phi_full
-        """
-        if (phi_full.ndim > 2) or (phi_full.ndim < 1):
-            print(f"Provided phase vector has {phi_full.ndim} dimensions.")
-            print("This is not accepted.")
-            return
-        elif phi_full.ndim == 1:
-            phi_full=phi_full[np.newaxis,:]
+        # Propagation
+        for ii in range(self.n_mixing_layers - 1): 
+            # Multiplication by the current mixing layer
+            U = self.M[ii] @ U  
             
-        if phi_full.shape[1] == self.nPhases:
-            self.nU=phi_full.shape[0]
-            self.phi=phi_full
-        else:
-            print("Provided phase vector has bad size. Not taken.")
+            # Extract phases for the current layer
+            # Each layer has exactly (n_modes - 1) phases
+            start_idx = ii * (self.n_modes - 1)
+            end_idx = (ii + 1) * (self.n_modes - 1)
+            layer_phases = phases[start_idx:end_idx]
+            
+            # Transform the 1D array into a 2D column vector (n_modes - 1, 1)
+            # This allows broadcasting to correctly multiply the rows of U
+            phase_multiplier = np.exp(1j * layer_phases)[:, np.newaxis]
+            
+            # Apply the phase shift only to the first (n_modes - 1) rows
+            U[0:(self.n_modes - 1), :] = U[0:(self.n_modes - 1), :] * phase_multiplier
+            
+        # Last layer
+        U = self.M[-1] @ U 
         
-        return
-        
-   
-    def phasesFromU(self,Utarget,maxIter=100000,tarInf=1e-10,plotGraph=False):
+        return U        
+    
+    
+    def phases_from_U(self, U_target: np.ndarray, max_iter: int = 100000, target_infidelity: float = 1e-5, plot_graph: bool = False) -> np.ndarray:
         """
-        Given a unitary matrix Utarget, finds the phases that implement it
-        with the UPP. Actually, to find the matrix more phases are used internally.
+        Given a unitary matrix U_target, finds the phases that implement it
+        with the UPP. 
+        
+        Actually, to find the matrix more phases are used internally.
         Then, phases that are not used in the processor are simplified.
         The final matrix adheres to the target one only up to input/output
         phase terms.
-        """
-        #maxIter is the maximum number of iterations
-        #tarInf is the target infidelity
-        
-        print("Iterative phases otpimization to find the target unitary.")
-        nV=self.nM+1 #number of mixing matrices + the inverse of the target
-        V=np.zeros((nV,self.n,self.n)).astype('complex') #array of matrices
-        V[:-1,:,:]=self.M #the V matrices are the mixing matrices of the UPP
-        V[-1,:,:] = Utarget.conj().T #except from the last one which is the inverse
-                                    #of the target
 
-        phaseTerms=np.exp(1j*np.random.rand(self.n+2,self.n)*2*np.pi) 
-                    #phase terms are introduced before each V matrix in this
-                    #decomposition; they are here initialized to random values
+        Parameters
+        ----------
+        U_target : np.ndarray
+            Target unitary matrix.
+        max_iter : int, optional
+            Maximum number of iterations.
+        target_infidelity : float, optional
+            Target infidelity.
+        plot_graph : bool, optional
+            If True, plots the infidelity trend over iterations.
+            
+        Returns
+        -------
+        np.ndarray
+            The 1D array of optimal phases in rad.
+        """
+        print("Iterative phases optimization to find the target unitary.")
         
-        fidelityMonitor=np.zeros(maxIter)
+        n_matrices = self.n_mixing_layers + 1  # Number of mixing matrices + the inverse of the target
+        v_matrices = np.zeros((n_matrices, self.n_modes, self.n_modes), dtype=complex)  # Array of matrices
+        v_matrices[:-1] = self.M  # The V matrices are the mixing matrices of the UPP
+        v_matrices[-1] = U_target.conj().T  # Except from the last one which is the inverse of the target
+
+        # Phase terms are introduced before each V matrix in this
+        # decomposition; they are here initialized to random values
+        phase_terms = np.exp(1j * np.random.rand(self.n_modes + 2, self.n_modes) * 2 * np.pi) 
         
-        start_time=time.time()
-        for jj in range(maxIter):
+        fidelity_monitor = np.zeros(max_iter)
+        
+        start_time = time.time()
+        
+        for step in range(max_iter):
           
-            B=np.eye(self.n).astype('complex') #buffer matrix
+            buffer_matrix = np.eye(self.n_modes, dtype=complex)
             
-            for ii in range(nV): #calculates the matrix product
-                B = B  * (phaseTerms[ii, :])[:,np.newaxis]  #first phases (multiply rows )
-                B = V[ii,:,:] @ B # then mixing matrix
+            for ii in range(n_matrices):  # Calculates the matrix product
+                buffer_matrix = buffer_matrix * (phase_terms[ii, :])[:, np.newaxis]  # First phases (multiply rows)
+                buffer_matrix = v_matrices[ii, :, :] @ buffer_matrix  # Then mixing matrix
             
-            #checks fidelity
-            fidelityMonitor[jj]=np.abs(np.trace( B )/self.n)**2
-            #if it is high enough it stops cycling
-            if (1-fidelityMonitor[jj])<tarInf:
-                fidelityMonitor=fidelityMonitor[0:(jj-1)]
+            # Checks fidelity
+            fidelity_monitor[step] = np.abs(np.trace(buffer_matrix) / self.n_modes)**2
+            
+            # If it is high enough it stops cycling
+            if (1 - fidelity_monitor[step]) < target_infidelity:
+                fidelity_monitor = fidelity_monitor[:step]  # Truncates the unused part of the array
                 break
             
-            if jj % 1000 == 0:
-                print("Iteration ",jj)
+            if step % 1000 == 0:
+                print(f"Iteration {step}")
             
-            #if not, it performs another update cycle of all matrices
-            for ii in range(nV):
-                #expose phases
-                B = B * phaseTerms[ii, :].conj() #multiply columns, as right multiplication
-                                            # of a diagonal matrix
-                #update phase list
-                theDiagonal= np.diag(B).conj()
-                phaseTerms[ii,:] = theDiagonal / np.abs( theDiagonal ) 
-                #applies new phases
-                B = B * (phaseTerms[ii, :])[:,np.newaxis]  #multiply rows 
-                #removes next mixing layer
-                B =  V[ii,:,:] @ B @ V[ii,:,:].conj().T
-        #end of optimization      
-        print("---Elapsed time: ", (time.time() - start_time), " seconds.")
+            # If not, it performs another update cycle of all matrices
+            for ii in range(n_matrices):
+                # Expose phases
+                buffer_matrix = buffer_matrix * phase_terms[ii, :].conj()  # Multiply columns
+                
+                # Update phase list
+                diagonal = np.diag(buffer_matrix).conj()
+                phase_terms[ii, :] = diagonal / np.abs(diagonal) 
+                
+                # Applies new phases
+                buffer_matrix = buffer_matrix * (phase_terms[ii, :])[:, np.newaxis]  # Multiply rows 
+                
+                # Removes next mixing layer
+                buffer_matrix = v_matrices[ii, :, :] @ buffer_matrix @ v_matrices[ii, :, :].conj().T
+                
+        # End of optimization      
+        print(f"--- Elapsed time: {(time.time() - start_time):.2f} seconds.")
         
-        #brings phases back into the UPP; from now on phaseTerms contains
-        #phases as real numbers
-        phaseTerms=np.angle(phaseTerms)
-        phaseTerms=phaseTerms-phaseTerms[:,-1,np.newaxis] #subtracts the phase of the last mode
-        phaseTerms=phaseTerms[1:-1,:] #remove external phases
-        phaseTerms[0,::2]=phaseTerms[0,::2]-phaseTerms[0,1::2] #first layer only even modes 
-        phaseTerms[0,1::2]=0
-        phaseTerms[-1,1:self.n-1:2]=phaseTerms[-1,1:self.n-1:2]-phaseTerms[-1,2:self.n-1:2] #last layer only odd modes
-        phaseTerms[-1,:self.n-1:2]=0
-        phaseTerms=phaseTerms[:,:-1] #removes last mode
-
-        self.nU=1        
-        self.phi=phaseTerms.reshape(1,phaseTerms.size) #reshapes and re-import into the processor
-        self.calcU() #updates U
+        # Brings phases back into the UPP; from now on phase_terms contains
+        # phases as real numbers
+        phase_terms = np.angle(phase_terms)
+        phase_terms = phase_terms - phase_terms[:, -1, np.newaxis]  # Subtracts the phase of the last mode
+        phase_terms = phase_terms[1:-1, :]  # Remove external phases
+        phase_terms[0, ::2] -= phase_terms[0, 1::2]  # First layer only even modes 
+        phase_terms[0, 1::2] = 0.0
+        phase_terms[-1, 1:self.n_modes - 1:2] -= phase_terms[-1, 2:self.n_modes - 1:2]  # Last layer only odd modes
+        phase_terms[-1, :self.n_modes - 1:2] = 0.0
+        phase_terms = phase_terms[:, :-1]  # Removes last mode        
+        phases = phase_terms.flatten()
+        phases = np.mod(phases, 2 * np.pi)
         
-        if plotGraph==True:
+        # Output for debug
+        if plot_graph:
             plt.figure()
             plt.clf()
-            plt.semilogy(1-fidelityMonitor)
+            plt.semilogy(1 - fidelity_monitor)
             plt.xlabel("Iteration number")
             plt.ylabel("Infidelity")
             
-    def calibrateUPP(self,setOfUAmpl,I2,A0):
-        """
-        Returns an optimized vector of coefficients A (which includes
-        the cross-talk coefficients and the phases at rest), given:
-            setOfUAmpl: a stack of real matrices namely an array (nU,n,n)
-            containing only the moduli of nU unitary matrices
-            I2: an array (nU,n(n-1)) namely containing nU vectors 
-            of n(n-1) currents -- includes the ones not corresponding to used
-            phase shifters
-            A0: an initial guess for A
-        """
-        Abuffer=A0.copy()*0 #prepares an empty array which is needed for the function tryAInfidelity
-        
-        def tryAInfidelity(Atry):
-            #function that tries a given set Atry coeff. with a given set of current I2
-            #then, it gives the fidelity with respect to setOfUAmpl
-            #I2 has the full number of components n*(n-1)
-            #Atry has only the number of components nTotCoeff
-            nonlocal I2
-            nonlocal setOfUAmpl
-            nonlocal Abuffer
-            nonlocal self
-            
-            Abuffer[self.Amask]=Atry
-            self.phasesFromCurrAndA(I2,Abuffer)
-            self.calcU()
-            
-            return (1-self.amplitudeFidelityWith(setOfUAmpl))
-
-        def callback(xk): #function that prints the current infidelity in the iterations
-            nonlocal ii
-            ii=ii+1
-            print("- ", ii," - Now infidelity", tryAInfidelity(xk))
+        return phases
 
         
-        start_time=time.time()
-        #Performs the optimization
-        ii=0
-        FitRes=sp.optimize.minimize(tryAInfidelity,A0[self.Amask],options={'disp': True},callback=callback)
-        
-        Afit=A0
-        Afit[self.Amask]=FitRes.x
-        print("---Elapsed time: ", (time.time() - start_time), " seconds.")
-        
-        return Afit
-
-
-###############################################################################
-#                       OTHER USEFUL FUNCTIONS                                #
-###############################################################################
+if __name__ == "__main__":
+    from tools import fidelity, get_haar_unitary, make_real_border  # Import tools for UPPs
     
-def importEphosCalibration(UPPobject: Mesh, fileName: str):
-    """
-    Import calibration data from pickle file, formatted according to
-    Ciro's conventions.
-    """
-    with open(fileName, 'rb') as f:
-        calibration = pickle.load(f)
-        phi0 = calibration['static_phases']   # rad
-        Cmatrix = calibration['xt_matrix']       # rad/mA^2
-        M = calibration['n_heaters']
-    
-    if M != UPPobject.nPhases:
-        print("Wrong number of phases. Import aborted.")
-        return
-    
-    for ii in range(UPPobject.n):
-        UPPobject.Astored[ii * (UPPobject.n-1)**2 : (ii+1) * (UPPobject.n-1)**2
-                          ] = Cmatrix[ ii*(UPPobject.n-1):(ii+1)*(UPPobject.n-1), 
-                                      ii*(UPPobject.n-1):(ii+1)*(UPPobject.n-1) ].reshape(-1)
-                                      
-    UPPobject.Astored[(UPPobject.n*(UPPobject.n-1)**2):]=phi0
+    try:
+        # Configuration
+        n = 6
+        #processor = Bell(n_modes=n, calibration_file='./bkp/20260213_model_large_parameters_noBSerr.pickle') 
+        processor = Bell(n_modes=n)
+
+        # 1. Target: Generate a random Haar unitary and make it "real-bordered"
+        u_target_raw = get_haar_unitary(n)
+        u_target, _, _ = make_real_border(u_target_raw)
+
+        # 2. Decomposition: Solve for target phases and then for required currents
+        phases_target = processor.phases_from_U(u_target)
+        currents_target = processor.currents_from_phases(phases_target)
+
+        # 3. Forward Propagation: From currents, retrieve phases and compute final unitary
+        # Note: phases_from_currents accounts for internal cross-talk
+        phases_exp = processor.phases_from_currents(currents_target)
+        u_exp_raw = processor.U_from_phases(phases_exp)
+        
+        # 4. Real-border the experimental unitary for a consistent fidelity comparison
+        u_exp, _, _ = make_real_border(u_exp_raw)
+
+        # 5. Calculate Fidelity
+        fid = fidelity(u_target, u_exp)
+        
+        print("-" * 45)
+        print("--- Decomposition and Forward Propagation Test ---")
+        print(f"Modes: {n}")
+        print(f"Final Fidelity: {fid:.6f}")
+        
+        # Validation check
+        if fid > 0.9999:
+            print("Test PASSED: Decomposition and propagation are accurate.")
+        else:
+            print("Warning: Fidelity is below the expected threshold.")
+        print("-" * 45)
+
+    except Exception as e:
+        print(f"An error occurred during the test: {e}")

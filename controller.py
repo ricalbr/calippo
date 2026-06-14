@@ -26,8 +26,8 @@ from SantecOPM150 import OPM150
 from Qontrol import Q8iv
 
 # UPP imports
-from .tools import sinkhorn
-from .model import Bell, Clements
+from tools import sinkhorn
+from model import Bell, Clements
 
 
 class UniversalPhotonicProcessor:
@@ -133,6 +133,7 @@ class UniversalPhotonicProcessor:
         else:
             self.drv = None
 
+
     def measure_power_matrix(self) -> np.ndarray:
         """
         Measure the raw NxN optical power matrix.
@@ -160,6 +161,7 @@ class UniversalPhotonicProcessor:
         power_matrix[power_matrix < 0] = 0
         return power_matrix
     
+    
     def measure_unitary_matrix(self) -> np.ndarray:
         """
         Measure the power matrix, apply Sinkhorn normalization and return
@@ -182,6 +184,7 @@ class UniversalPhotonicProcessor:
             print("[UPP] ... Normalizing...")
         normalized_power, _, _ = sinkhorn(power_matrix)
         return np.sqrt(normalized_power)
+
 
     def measure_shifter_resistances(self, test_current: float = 2.0) -> np.ndarray:
         """
@@ -215,6 +218,7 @@ class UniversalPhotonicProcessor:
             print("[UPP] ... Done!")
         return resistances
 
+
     def set_shifter_currents(self, currents: np.ndarray):
         """
         Apply a vector of currents to all mapped phase shifters.
@@ -234,6 +238,7 @@ class UniversalPhotonicProcessor:
             raise RuntimeError("[UPP] Electrical hardware (Qontrol) not initialized.")
         self.drv.set_current(self.shifter_map, currents)
 
+
     def set_all_zero(self):
         """
         Set all phase shifter currents to zero.
@@ -246,7 +251,8 @@ class UniversalPhotonicProcessor:
         if not self.drv:
              raise RuntimeError("[UPP] Electrical hardware (Qontrol) not initialized.")
         self.drv.set_all_zero()
-            
+         
+        
     def close(self):
         """
         Release only initialized hardware resources.
