@@ -87,11 +87,13 @@ def sinkhorn(U: np.ndarray, tol: float = 1e-6, max_iter: int = 1000) -> Tuple[np
         err_row = np.max(np.abs(1 - row_sums))
         if max(err_col, err_row) < tol:
             break
+        
     else:
         print(f"[WARNING] Sinkhorn did not converge within {max_iter} iterations.")
 
     if is_2d:
         return U_work[0], D_in[0], D_out[0]
+    
     return U_work, D_in, D_out
 
 

@@ -58,9 +58,9 @@ class Mesh(ABC):
             print("Modes must be EVEN for this version.")
             print(f"We shall take {n_modes} modes.")
             
-        self.n_modes: int = n_modes                                      # Number of modes
-        self.n_phases: int = (n_modes - 1) * n_modes                     # Number of tunable parameters
-        self.n_used_phases: int = (n_modes - 1) * (n_modes - 1)          # Number of tunable parameters actually used in the experiments
+        self.n_modes = n_modes                                      # Number of modes
+        self.n_phases = (n_modes - 1) * n_modes                     # Number of tunable parameters
+        self.n_used_phases = (n_modes - 1) * (n_modes - 1)          # Number of tunable parameters actually used in the experiments
                         
         # This part builds the specific topology of the mesh (implemented by children)
         self.static_phases_mask, self.xtalk_mask = self._generate_masks()    # Masks that relate the used calibration parameters to the available ones 
@@ -460,7 +460,6 @@ class Bell(Mesh):
             
             # Broadcasting: add a column axis to correctly multiply rows
             phase_multiplier = np.exp(1j * layer_phases)[:, :, np.newaxis]
-            
             
             # Apply the phase shift only to the first (n_modes - 1) rows
             U[:, 0:(self.n_modes - 1), :] *= phase_multiplier
