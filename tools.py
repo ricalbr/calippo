@@ -21,20 +21,15 @@ fidelity(U_target, U_exp)
     Calculate the standard fidelity for complex unitaries.
 make_real_border(U)
     Make a unitary matrix "real-bordered" by zeroing angles on 1st row/col.
-get_haar_unitary(size)
-    Generate a complex random Haar-distributed unitary matrix.
+get_haar_unitary(size, batch_size=1)
+    Generate a complex random Haar-distributed unitary matrix or batch.
 """
 
 import numpy as np
-from scipy.stats import unitary_group
 from typing import Tuple
 
 
-def sinkhorn(
-    U: np.ndarray, 
-    tol: float = 1e-3, 
-    max_iter: int = 1000
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def sinkhorn(U: np.ndarray, tol: float = 1e-6, max_iter: int = 1000) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Normalize a (batch of) positive matrices using the Sinkhorn–Knopp algorithm.
 
@@ -47,10 +42,10 @@ def sinkhorn(
 
     Parameters
     ----------
-    U : np.ndarray, shape (N, N) or (M, N, N)
+    U : np.ndarray, shape (N, N) or (B, N, N)
         Input matrix or batch of matrices with strictly positive entries.
     tol : float, optional
-        Convergence tolerance. Default is 1e-3.
+        Convergence tolerance. Default is 1e-6.
     max_iter : int, optional
         Maximum number of iterations allowed. Default is 1000.
 
@@ -70,18 +65,18 @@ def sinkhorn(
     else:
         U_work = U.astype(float, copy=True)
     
-    M, N, _ = U_work.shape
-    D_in = np.ones((M, N))
-    D_out = np.ones((M, N))
+    B, N, _ = U_work.shape
+    D_in = np.ones((B, N))
+    D_out = np.ones((B, N))
     
     for i in range(max_iter):
-        # --- Column normalization ---
+        # Column normalization
         col_sums = np.sum(U_work, axis=1)
         T_in = 1.0 / col_sums
         U_work = U_work * T_in[:, np.newaxis, :]
         D_in *= T_in
         
-        # --- Row normalization ---
+        # Row normalization
         row_sums = np.sum(U_work, axis=2)
         T_out = 1.0 / row_sums
         U_work = T_out[:, :, np.newaxis] * U_work
@@ -107,19 +102,19 @@ def amplitude_fidelity(U_target: np.ndarray, U_exp: np.ndarray) -> np.ndarray:
     This metric evaluates the similarity between the magnitudes of the 
     matrix elements, ignoring phase differences. It is useful when only 
     power measurements are available. Supports single (N, N) or batch 
-    (M, N, N) matrices.
+    (B, N, N) matrices.
     
     Parameters
     ----------
-    U_target : np.ndarray, shape (N, N) or (M, N, N)
+    U_target : np.ndarray, shape (N, N) or (B, N, N)
         The ideal or target unitary matrix (or batch of matrices).
-    U_exp : np.ndarray, shape (N, N) or (M, N, N)
+    U_exp : np.ndarray, shape (N, N) or (B, N, N)
         The experimental or measured matrix (or batch of matrices).
 
     Returns
     -------
     np.ndarray
-        Amplitude fidelity values between 0 and 1 (scalar or array of shape (M,)).
+        Amplitude fidelity values between 0 and 1 (scalar or array of shape (B,)).
     """
     return fidelity(np.abs(U_target), np.abs(U_exp))
 
@@ -134,122 +129,231 @@ def fidelity(U_target: np.ndarray, U_exp: np.ndarray) -> np.ndarray:
         F = |Tr(U_target^H @ U_exp)| / N.
     
     This metric is sensitive to relative phases but invariant to a 
-    global phase shift. Supports both single (N, N) and batch (M, N, N) 
+    global phase shift. Supports both single (N, N) and batch (B, N, N) 
     matrices.
     
     Parameters
     ----------
-    U_target : np.ndarray, shape (N, N) or (M, N, N)
+    U_target : np.ndarray, shape (N, N) or (B, N, N)
         The ideal or target unitary matrix (or batch of matrices).
-    U_exp : np.ndarray, shape (N, N) or (M, N, N)
+    U_exp : np.ndarray, shape (N, N) or (B, N, N)
         The experimental or measured matrix (or batch of matrices).
 
     Returns
     -------
     np.ndarray
-        Fidelity values between 0 and 1 (scalar or array of shape (M,)).
+        Fidelity values between 0 and 1 (scalar or array of shape (B,)).
     """
+    # Check dimension to guarantee vectorial shape
+    is_2d = U_target.ndim == 2
+    if is_2d:
+        U_target = U_target[np.newaxis, ...]    
+    if U_exp.ndim == 2:
+        U_exp = U_exp[np.newaxis, ...]
+    
     N = U_target.shape[-1]
     
-    # Calcolo dell'overlap (batch o singolo)
+    # Calculate overlap using trace of (U_target^H @ U_exp)
     overlap = np.sum(U_target.conj() * U_exp, axis=(-2, -1))
     
-    # Restituisce l'array delle fedeltà
-    return np.abs(overlap) / N
+    # Calculate fidelity
+    fid = np.abs(overlap) / N
+    
+    return fid[0] if is_2d else fid
 
 
 def make_real_border(U: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Make a unitary matrix "real-bordered".
+    Make a unitary matrix or batch of matrices "real-bordered".
 
-    Calculates the diagonal unitaries Dleft and Dright such that
-    R = Dleft @ U @ Dright has entirely real elements on its first row 
+    Calculates the diagonal unitaries D_left and D_right such that
+    R = D_left @ U @ D_right has entirely real elements on its first row 
     and first column. The elements of the first row and first column 
     of the input matrix U must be non-vanishing.
 
     Parameters
     ----------
-    U : np.ndarray, shape (N, N)
-        The input unitary matrix to be modified.
+    U : np.ndarray, shape (N, N) or (B, N, N)
+        The input unitary matrix (or batch) to be modified.
 
     Returns
     -------
     R : np.ndarray
-        The real-bordered unitary matrix.
-    Dleft : np.ndarray
-        The left diagonal unitary correction matrix.
-    Dright : np.ndarray
-        The right diagonal unitary correction matrix.
+        The real-bordered unitary matrix (or batch).
+    D_left : np.ndarray
+        The left diagonal unitary correction matrix (or batch).
+    D_right : np.ndarray
+        The right diagonal unitary correction matrix (or batch).
     """
-    Dright = np.diag(U[0, :].conj() / np.abs(U[0, :]))
-    U1 = U @ Dright
-    Dleft = np.diag(U1[:, 0].conj() / np.abs(U1[:, 0]))
+    # Check dimension to guarantee vectorial shape
+    is_2d = U.ndim == 2
+    if is_2d:
+        U = U[np.newaxis, ...]
+        
+    B, N, _ = U.shape
     
-    return Dleft @ U1, Dleft, Dright
+    # D_right calculation: first row phase cancellation
+    # Extract phases of the first row: (B, N)
+    row_phases = np.angle(U[:, 0, :])
+    D_right = np.exp(-1j * row_phases) # (B, N)
+    
+    # Apply D_right: (B, N, N) @ (B, N, N_diag)
+    U1 = U * D_right[:, np.newaxis, :]
+    
+    # D_left calculation: first column phase cancellation
+    # Extract phases of the first column: (B, N)
+    col_phases = np.angle(U1[:, :, 0])
+    D_left = np.exp(-1j * col_phases) # (B, N)
+    
+    # Apply D_left: (B, N_diag, N) @ (B, N, N)
+    R = U1 * D_left[:, :, np.newaxis]
+    
+    if is_2d:
+        return R[0], np.diag(D_left[0]), np.diag(D_right[0])
+    
+    # Return as diagonal matrices for consistency with previous 2D implementation
+    # Note: Using batch-wise diagonal creation
+    D_left_mat = np.eye(N) * D_left[:, np.newaxis, :]
+    D_right_mat = np.eye(N) * D_right[:, np.newaxis, :]
+    
+    return R, D_left_mat, D_right_mat
 
 
-def get_haar_unitary(size: int) -> np.ndarray:
+def get_haar_unitary(size: int, batch_size: int = 1) -> np.ndarray:
     """
-    Generate a random unitary matrix sampled from the Haar measure.
+    Generate a batch of Haar-distributed unitary matrices using QR decomposition.
+    This avoids Python loops by leveraging NumPy/SciPy's vectorized QR.
 
     Parameters
     ----------
     size : int
         The dimension N of the NxN unitary matrix.
+    batch_size : int, optional
+        The number of matrices to generate. Defaults to 1.
 
     Returns
     -------
     np.ndarray
-        A complex NxN Haar-random unitary matrix.
+        A complex NxN Haar-random unitary matrix (shape (N, N) if batch_size=1, 
+        or shape (B, N, N) if batch_size > 1).
     """
-    return unitary_group.rvs(size)
-
+    # Generate random complex matrices: (B, N, N).
+    # Using standard normal distribution for real and imaginary parts
+    X = (np.random.randn(batch_size, size, size) + 1j * np.random.randn(batch_size, size, size)) / np.sqrt(2)
+    
+    # QR decomposition (vectorized over the first dimension)
+    # np.linalg.qr returns Q and R. Q is unitary.
+    Q, R = np.linalg.qr(X)
+    
+    # Adjust for Haar measure.
+    # The QR decomposition gives a unitary Q, but the sign/phase of the 
+    # columns might be arbitrary. We multiply by the phase of the diagonal of R 
+    # to ensure the distribution is uniquely Haar.
+    phases = np.diagonal(R, axis1=1, axis2=2)
+    phases = phases / np.abs(phases)    
+    
+    # Apply phases: Q @ diag(phases)
+    Q *= phases[:, np.newaxis, :]
+    
+    return Q[0] if batch_size == 1 else Q
+    
+    
 # ==================================================================
 # Entry Point
 # ==================================================================
 if __name__ == "__main__":
     
-    try:
-        # Configuration
-        size = 24
-        noise_intensity = 0.1
-        
-        # 1. Create target random Haar matrix
-        U_target = get_haar_unitary(size)
-        
-        # 2. Add noise (simulating experimental degradation)
-        # Note: adding noise directly to complex values breaks unitarity
-        noise = (np.random.randn(size, size) + 1j*np.random.randn(size, size)) * noise_intensity
-        U_noisy = U_target + noise
-        
-        # 3. Use Sinkhorn to recover a doubly stochastic matrix
-        # Note: we apply Sinkhorn to the power matrix (absolute squares) to preserve normalization
-        U_power = np.abs(U_noisy)**2
-        U_norm_power, _, _ = sinkhorn(U_power)
-        
-        # 4. Reconstruct normalized complex matrix (preserving noisy phases)
-        U_restored = np.sqrt(U_norm_power) * np.exp(1j * np.angle(U_noisy))
-        
-        # 5. Calculate fidelity metrics
-        fid = fidelity(U_target, U_restored)
-        fid_amp = amplitude_fidelity(U_target, U_restored)
-        
-        print("--- Matrix Normalization and Fidelity Test ---")
-        print(f"Noise Intensity:    {noise_intensity}")
-        print(f"Fidelity:           {fid:.5f}")
-        print(f"Amplitude Fidelity: {fid_amp:.5f}")
-        
-        # 6. Test make_real_border
-        R, Dleft, Dright = make_real_border(U_target)
+    import matplotlib.pyplot as plt   
+    
+    # Configuration
+    size = 24
+    batch_size = 100
+    noise_intensity = 0.1
 
-        # Calculate the sum of the absolute imaginary parts on the first row and column
-        # If the function works correctly, these values should be extremely close to 0
-        imag_sum_row = np.sum(np.abs(np.imag(R[0, :])))
-        imag_sum_col = np.sum(np.abs(np.imag(R[:, 0])))
+    # HAAR VALIDATION
+    print(f"--- Statistical Verification of Haar Distribution (N={size}, Batch Size: {batch_size}) ---")
+    U_batch = get_haar_unitary(size, batch_size)
+    
+    # Dimensional promotion for 3D testing to avoid shape errors
+    U_test = U_batch[np.newaxis, ...] if U_batch.ndim == 2 else U_batch
+    
+    # 1. Test Unitarity: U^H @ U should be I
+    U_H = U_test.conj().transpose(0, 2, 1)
+    error_unitarity = np.mean(np.abs(U_H @ U_test - np.eye(size)))
+    print(f"Mean Unitarity Error:      {error_unitarity:.2e}")
+    
+    # 2. Test Eigenvalue Distribution: 
+    # Calculate eigenvalues for the whole batch
+    eigenvalues = np.linalg.eigvals(U_batch).flatten()
+    
+    fig, ax = plt.subplots(figsize=(6, 6))
+    
+    # Plot the unit circle reference
+    theta = np.linspace(0, 2 * np.pi, 100)
+    ax.plot(np.cos(theta), np.sin(theta), 'k--', alpha=0.3, label='Unit Circle')
+    
+    # Plot the eigenvalues
+    ax.scatter(eigenvalues.real, eigenvalues.imag, s=1, alpha=0.2, c='blue', label='Eigenvalues')
+    
+    ax.set_aspect('equal')
+    ax.set_xlabel('Real Part')
+    ax.set_ylabel('Imaginary Part')
+    ax.set_title(f'Eigenvalue Distribution (Haar Unitary, N={U_test.shape[-1]})')
+    ax.legend()
+    plt.grid(True, linestyle=':', alpha=0.6)
+    plt.show()
+    
+    # OTHER TOOL VALIDATION   
+    print(f"\n--- Matrix Normalization and Fidelity Test (N={size}, Batch Size: {batch_size}) ---")
+
+    # 1. Create target random Haar matrices
+    U_target = get_haar_unitary(size, batch_size=batch_size)
+    
+    # 2. Add noise
+    # Maintain the dimensional symmetry of the noise based on the target.
+    if U_target.ndim == 2:
+        noise = (np.random.randn(size, size) + 1j * np.random.randn(size, size)) * noise_intensity
+    else:
+        noise = (np.random.randn(batch_size, size, size) + 1j * np.random.randn(batch_size, size, size)) * noise_intensity
         
-        print("\n--- Real Border Test ---")
-        print(f"Residual imaginary sum (1st row): {imag_sum_row:.2e}")
-        print(f"Residual imaginary sum (1st col): {imag_sum_col:.2e}")
-        
-    except Exception as e:
-        print(f"An error occurred: {e}.")
+    U_noisy = U_target + noise
+    
+    # 3. Use Sinkhorn to recover a doubly stochastic matrix
+    U_power = np.abs(U_noisy)**2
+    U_norm_power, _, _ = sinkhorn(U_power)
+    
+    # Dimensional promotion for safe row/col sums
+    U_norm_test = U_norm_power[np.newaxis, ...] if U_norm_power.ndim == 2 else U_norm_power
+    max_row_err = np.max(np.abs(np.sum(U_norm_test, axis=2) - 1.0))
+    max_col_err = np.max(np.abs(np.sum(U_norm_test, axis=1) - 1.0))
+    print(f"Sinkhorn Max Row Error:    {max_row_err:.2e}")
+    print(f"Sinkhorn Max Col Error:    {max_col_err:.2e}")
+    
+    # 4. Reconstruct normalized complex matrix
+    # Broadcasting phase preservation across the batch
+    U_restored = np.sqrt(U_norm_power) * np.exp(1j * np.angle(U_noisy))
+    
+    # 5. Calculate fidelity metrics
+    # The method fidelity returns an array of shape (B,) or a scalar
+    fids = fidelity(U_target, U_restored)
+    fids_amp = amplitude_fidelity(U_target, U_restored)
+    
+    print(f"Noise Intensity:           {noise_intensity}")
+    print(f"Mean Fidelity:             {np.mean(fids):.5f}")
+    print(f"Mean Amp Fidelity:         {np.mean(fids_amp):.5f}")
+    
+    # 6. Test make_real_border
+    # R is (B, N, N) or (N, N)
+    R, _, _ = make_real_border(U_target)
+
+    # Dimensional promotion for 3D testing
+    R_test = R[np.newaxis, ...] if R.ndim == 2 else R
+
+    # Calculate the max sum of absolute imaginary parts on the first row and column
+    # Sum over dimensions 1 or 2 (within each matrix), then extract max over the batch
+    imag_sum_row = np.max(np.sum(np.abs(np.imag(R_test[:, 0, :])), axis=1))
+    imag_sum_col = np.max(np.sum(np.abs(np.imag(R_test[:, :, 0])), axis=1))
+    
+    print("\n--- Real Border Test (Batch Average) ---")
+    print(f"Residual imaginary sum (1st row): {imag_sum_row:.2e}")
+    print(f"Residual imaginary sum (1st col): {imag_sum_col:.2e}")
