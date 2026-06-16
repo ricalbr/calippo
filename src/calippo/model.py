@@ -31,7 +31,7 @@ import matplotlib.pyplot as plt
 import time
 import pickle
 from abc import ABC, abstractmethod
-from typing import tuple, Optional
+from typing import Optional
 import numpy.typing as npt
 
 nparray = npt.NDArray
@@ -66,9 +66,7 @@ class Mesh(ABC):
 
         self.n_modes = n_modes  # Number of modes
         self.n_phases = (n_modes - 1) * n_modes  # Number of tunable parameters
-        self.n_used_phases = (
-            n_modes - 1
-        ) ** 2  # Number of tunable parameters actually used in the experiments
+        self.n_used_phases = (n_modes - 1) ** 2  # Number of in-use tunable parameters
 
         # This part builds the specific topology of the mesh (implemented by children)
         self.static_phases_mask, self.xtalk_mask = (
@@ -88,11 +86,11 @@ class Mesh(ABC):
 
         # Output
         msg = (
-            "A new processor was created.\n",
-            f"This has {self.n_modes} modes, {self.n_phases} tunable phases.\n",
-            f"Only {self.n_used_phases} phases are actually used.\n",
+            "A new processor was created.\n"
+            + f"This has {self.n_modes} modes, {self.n_phases} tunable phases.\n"
+            + f"Only {self.n_used_phases} phases are actually used.\n",
         )
-        print(msg)
+        print(*msg)
 
     @abstractmethod
     def _generate_masks(self) -> tuple[nparray, nparray]:
@@ -144,6 +142,9 @@ class Mesh(ABC):
         static_phases = np.mod(calibration["static_phases"], 2 * np.pi)
         static_phases = static_phases * self.static_phases_mask
         xtalk = calibration["xt_matrix"]
+        print(xtalk)
+        plt.imshow(xtalk)
+        plt.show()
         xtalk = xtalk * self.xtalk_mask
 
         return static_phases, xtalk
@@ -320,9 +321,8 @@ class Mesh(ABC):
     def phases_from_U(
         self,
         U_target: nparray,
-        max_iter: int = 100000,
         target_infidelity: float = 1e-6,
-        plot_graph: bool = False,
+        **kwargs,
     ) -> nparray:
         pass
 
@@ -338,22 +338,29 @@ class Clements(Mesh):
     """
 
     def _generate_masks(self) -> tuple[nparray, nparray]:
-        pass
+        return np.array([0]), np.array([0])
 
     def _generate_mixing_layers(self) -> tuple[int, nparray]:
-        pass
+        return 0, np.array([0])
 
     def U_from_phases(self, phases: nparray) -> nparray:
-        pass
+        return np.array([0])
 
     def phases_from_U(
         self,
         U_target: nparray,
-        max_iter: int = 100000,
         target_infidelity: float = 1e-6,
-        plot_graph: bool = False,
+        **kwargs,
     ) -> nparray:
-        pass
+
+        _, Tlist = self.rectangular_MZ(
+            U=U_target, tol=target_infidelity, rearrange=True
+        )
+        a = list()
+        for t in Tlist:
+            _, _, theta, phi, _ = t
+            a.append([theta, phi])
+        return np.array(a)
 
     def mach_zehnder(
         self, m: int, n: int, internal_phase: float, external_phase: float, nmax: int
@@ -374,13 +381,11 @@ class Clements(Mesh):
         mat[n, n] = -g * s
         return np.round(mat, 14)
 
-
-    def mach_zehnder_inv(self,m, n, phi_int, phi_ext, nmax):
+    def mach_zehnder_inv(self, m, n, phi_int, phi_ext, nmax):
         r"""The inverse of the Mach-Zehnder unitary matrix.
         See :func:`~.mach_zehnder` for more details on the Mach-Zehnder unitary.
         """
         return self.mach_zehnder(m, n, phi_int, phi_ext, nmax).conj().T
-
 
     @staticmethod
     def nullMZi(m, n, U):
@@ -413,7 +418,6 @@ class Clements(Mesh):
 
         return [n, n + 1, phi_i, phi_e, nmax]
 
-
     @staticmethod
     def nullMZ(n, m, U):
         r"""Nullifies element n,m of U using mach_zehnder.
@@ -444,7 +448,6 @@ class Clements(Mesh):
             phi_e = -np.angle(r) % (2 * np.pi)
 
         return [n - 1, n, phi_i, phi_e, nmax]
-
 
     def rectangular_MZ(self, U, tol: float = 1e-11, rearrange: bool = False):
         r"""Rectangular decomposition of a unitary matrix, with local
@@ -519,7 +522,6 @@ class Clements(Mesh):
         else:
             return localU, tilist
 
-
     @staticmethod
     def rearrange_clements(output: list[list]) -> list[list]:
         """Reorder the list of beam splitters to match the physical mesh layout."""
@@ -578,26 +580,23 @@ class Bell(Mesh):
             A tuple containing (static_phases_mask, xtalk_mask).
         """
         # Mask for phases and currents that relate the actual free parameters of calibration to the available ones
-        static_phases_mask = np.ones(
-            (self.n_modes, self.n_modes - 1)
-        )  # We have n(n-1) overall phases
+        static_phases_mask = np.ones((self.n_modes, self.n_modes - 1))  # n(n-1) overall phases
         static_phases_mask[0, :] = 0  # In the first layer we act only on the even ones
         static_phases_mask[0, ::2] = 1
         static_phases_mask[-1, :] = 0  # In the last layer we act only on the odd ones
         static_phases_mask[-1, 1::2] = 1
-        static_phases_mask = static_phases_mask.reshape(-1).astype(
-            "bool"
-        )  # Reshape into 1D array of bool
+        static_phases_mask = static_phases_mask.reshape(-1).astype( bool)  # Reshape into 1D array of bool
 
         # Mask for cross-talk coefficients
         xtalk_mask = np.ones(
             (self.n_modes, self.n_modes - 1, self.n_modes - 1)
         )  # We set a general framework of n layers with (n-1)x(n-1) coeff.
         xtalk_mask[0, :, :] = 0  # In the first layer we act only on the even modes
-        xtalk_mask[0, ::2, ::2] = 1
         xtalk_mask[-1, :, :] = 0  # In the last layer we act only on the odd ones
+        xtalk_mask[0, ::2, ::2] = 1
         xtalk_mask[-1, 1::2, 1::2] = 1
         xtalk_mask = sp.linalg.block_diag(*xtalk_mask)  # Reshape into 2D array of bool
+        print(xtalk_mask)
 
         return static_phases_mask, xtalk_mask
 
@@ -712,6 +711,7 @@ class Bell(Mesh):
         max_iter: int = 100000,
         target_infidelity: float = 1e-6,
         plot_graph: bool = False,
+        **kwargs,
     ) -> nparray:
         """
         Given a unitary matrix U_target, finds the phases that implement it
@@ -854,11 +854,8 @@ if __name__ == "__main__":
     from tools import fidelity, get_haar_unitary, make_real_border
 
     n = 6
-    batch_size = 10
-    processor = Bell(
-        n_modes=n,
-        calibration_file="./data/20260213_model_large_parameters_noBSerr.pickle",
-    )
+    batch_size = 1
+    processor = Bell( n_modes=n, calibration_file="./data/20260213_model_large_parameters_noBSerr.pickle",)
     processor = Bell(n_modes=n)
 
     print(f"\n--- Batch Testing ({batch_size} unitaries simultaneously) ---")
