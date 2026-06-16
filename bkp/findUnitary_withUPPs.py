@@ -7,23 +7,24 @@ Created on Mon Feb 23 13:11:46 2026
 """
 
 import numpy as np
-#import scipy as sp
+
+# import scipy as sp
 
 import UPPs
 
-nModes=6
+nModes = 6
 
-Utarget=UPPs.randomU(nModes) #extract random unitary
+Utarget = UPPs.randomU(nModes)  # extract random unitary
 
-bellone=UPPs.Bell(nModes)
+bellone = UPPs.Bell(nModes)
 
-bellone.phasesFromU(Utarget,plotGraph=True)
+bellone.phasesFromU(Utarget, plotGraph=True)
 
-Udone=bellone.U[0,:,:] #extracts U
-Udone=UPPs.makeRealBorder(Udone)[0] #make real bordered
+Udone = bellone.U[0, :, :]  # extracts U
+Udone = UPPs.makeRealBorder(Udone)[0]  # make real bordered
 
-UtargetR=UPPs.makeRealBorder(Utarget)[0] #also the target one
+UtargetR = UPPs.makeRealBorder(Utarget)[0]  # also the target one
 
-fidelityFinal=np.abs(np.sum(Udone*UtargetR.conj()))/nModes #and compares them
+fidelityFinal = np.abs(np.sum(Udone * UtargetR.conj())) / nModes  # and compares them
 
-print("Checking real-bordered matrices we have reached fidelity ",fidelityFinal)
+print("Checking real-bordered matrices we have reached fidelity ", fidelityFinal)

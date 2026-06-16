@@ -7,8 +7,8 @@ Created on Wed Feb  3 23:05:56 2026
 
 Control module for Universal Photonic Processors (UPP).
 
-This module provides a high-level class to automate the characterization of 
-multi-mode universal photonic processors, including optical transmission, 
+This module provides a high-level class to automate the characterization of
+multi-mode universal photonic processors, including optical transmission,
 unitary matrix measurement, and phase shifter resistance characterization.
 
 Classes
@@ -43,7 +43,7 @@ class UniversalPhotonicProcessor:
     num_modes : int
         Number of optical modes (dimension N).
     mesh_type : str
-        Topology of the photonic mesh (e.g., 'bell', 'clements'). 
+        Topology of the photonic mesh (e.g., 'bell', 'clements').
         Used to instantiate the correct digital twin.
     wavelength_nm : int
         Operation wavelength in nanometers.
@@ -76,10 +76,10 @@ class UniversalPhotonicProcessor:
         If an unsupported mesh type is provided.
     """
 
-    _MESHES_ = {'clements': Clements, 'bell': Bell}
+    _MESHES_ = {"clements": Clements, "bell": Bell}
 
     def __init__(
-        self, 
+        self,
         num_modes: int,
         mesh_type: str,
         wavelength_nm: int,
@@ -92,47 +92,69 @@ class UniversalPhotonicProcessor:
         shifter_channels: Optional[List[int]] = None,
         switch_transient: float = 0.5,
         UPP_transient: float = 0.5,
-        verbose: bool = True
+        verbose: bool = True,
     ):
         self.num_modes = num_modes
-        
+
         # Input validation for MZI mesh type
         if mesh_type.lower() not in self._MESHES_:
-            raise ValueError(f"[UPP][ERROR] Unsupported mesh_type: '{mesh_type}'. Available options: {list(self._MESHES_.keys())}")
+            raise ValueError(
+                f"[UPP][ERROR] Unsupported mesh_type: '{mesh_type}'. Available options: {list(self._MESHES_.keys())}"
+            )
         self.dtwin = self._MESHES_[mesh_type.lower()](num_modes)
-        
+
         self.imax = imax
         self.vmax = vmax
         self.verbose = verbose
         self.switch_transient = switch_transient
-        self.UPP_transient = UPP_transient        
-        
+        self.UPP_transient = UPP_transient
+
         # Setup optical and electrical mapping
-        self.input_map = switch_channels if switch_channels else list(range(1, num_modes + 1))
-        self.output_map = opm_channels if opm_channels else list(range(1, num_modes + 1))
-        self.shifter_map = shifter_channels if shifter_channels else list(range(0, num_modes*(num_modes-1)))
-        
+        self.input_map = (
+            switch_channels if switch_channels else list(range(1, num_modes + 1))
+        )
+        self.output_map = (
+            opm_channels if opm_channels else list(range(1, num_modes + 1))
+        )
+        self.shifter_map = (
+            shifter_channels
+            if shifter_channels
+            else list(range(0, num_modes * (num_modes - 1)))
+        )
+
         if len(self.input_map) != num_modes or len(self.output_map) != num_modes:
-            raise ValueError("[UPP][ERROR] Optical mapping lists must match number of modes N.")
-        if len(self.shifter_map) != num_modes*(num_modes-1):
-            raise ValueError("[UPP][ERROR] Electrical mapping lists must match number of shifters N(N-1).")
-            
+            raise ValueError(
+                "[UPP][ERROR] Optical mapping lists must match number of modes N."
+            )
+        if len(self.shifter_map) != num_modes * (num_modes - 1):
+            raise ValueError(
+                "[UPP][ERROR] Electrical mapping lists must match number of shifters N(N-1)."
+            )
+
         # Initialize Hardware 1 & 2: Fiber Switch and Power Meter (Optional)
         if switch_resource:
-            self.switch = FiberSwitch(switch_resource, transient=self.switch_transient, verbose=verbose)
+            self.switch = FiberSwitch(
+                switch_resource, transient=self.switch_transient, verbose=verbose
+            )
             self.pm = OPM150(power_unit=1, verbose=verbose)
             self.pm.wavelength = wavelength_nm
             self.pm.autorange_all(True)
         else:
             self.switch = None
             self.pm = None
-            
+
         # Initialize Hardware 3: Qontrol Driver (Optional)
         if q8iv_resource:
-            self.drv = Q8iv(q8iv_resource, init_mode="i", imax=self.imax, vmax=self.vmax, transient=self.UPP_transient, verbose=verbose)
+            self.drv = Q8iv(
+                q8iv_resource,
+                init_mode="i",
+                imax=self.imax,
+                vmax=self.vmax,
+                transient=self.UPP_transient,
+                verbose=verbose,
+            )
         else:
             self.drv = None
-
 
     def measure_power_matrix(self) -> np.ndarray:
         """
@@ -141,7 +163,7 @@ class UniversalPhotonicProcessor:
         Returns
         -------
         np.ndarray
-            NxN array where the element (j, i) represents the optical power 
+            NxN array where the element (j, i) represents the optical power
             (watts) from input i to output j.
 
         Raises
@@ -152,16 +174,17 @@ class UniversalPhotonicProcessor:
         if not self.switch or not self.pm:
             raise RuntimeError("[UPP] Optical hardware (switch/OPM) not initialized.")
         if self.verbose:
-            print(f"[UPP] Measuring the transmission on the {self.num_modes} input modes...")     
+            print(
+                f"[UPP] Measuring the transmission on the {self.num_modes} input modes..."
+            )
         power_matrix = np.zeros((self.num_modes, self.num_modes))
         for i, ch_in in enumerate(self.input_map):
-            self.switch.set_channel(ch_in)            
+            self.switch.set_channel(ch_in)
             column_powers = self.pm.read_power(channels=self.output_map)
             power_matrix[:, i] = np.array(column_powers)
         power_matrix[power_matrix < 0] = 0
         return power_matrix
-    
-    
+
     def measure_unitary_matrix(self) -> np.ndarray:
         """
         Measure the power matrix, apply Sinkhorn normalization and return
@@ -178,13 +201,14 @@ class UniversalPhotonicProcessor:
             If optical hardware (switch/OPM) has not been initialized.
         """
         if not self.switch or not self.pm:
-            raise RuntimeError("[UPP][ERROR] Optical hardware (switch/OPM) not initialized.")
+            raise RuntimeError(
+                "[UPP][ERROR] Optical hardware (switch/OPM) not initialized."
+            )
         power_matrix = self.measure_power_matrix()
         if self.verbose:
             print("[UPP] ... Normalizing...")
         normalized_power, _, _ = sinkhorn(power_matrix)
         return np.sqrt(normalized_power)
-
 
     def measure_shifter_resistances(self, test_current: float = 2.0) -> np.ndarray:
         """
@@ -206,18 +230,24 @@ class UniversalPhotonicProcessor:
             If electrical hardware (Qontrol) has not been initialized.
         """
         if not self.drv:
-            raise RuntimeError("[UPP][ERROR] Electrical hardware (Qontrol) not initialized.")
+            raise RuntimeError(
+                "[UPP][ERROR] Electrical hardware (Qontrol) not initialized."
+            )
         if self.verbose:
             print(f"[UPP] Measuring resistance for {len(self.shifter_map)} shifters...")
         try:
-            self.drv.set_current(self.shifter_map, [test_current] * len(self.shifter_map))
-            resistances = (np.array(self.drv.voltage)[self.shifter_map] / np.array(self.drv.current)[self.shifter_map]) * 1000.0
+            self.drv.set_current(
+                self.shifter_map, [test_current] * len(self.shifter_map)
+            )
+            resistances = (
+                np.array(self.drv.voltage)[self.shifter_map]
+                / np.array(self.drv.current)[self.shifter_map]
+            ) * 1000.0
         finally:
             self.drv.set_all_zero()
         if self.verbose:
             print("[UPP] ... Done!")
         return resistances
-
 
     def set_shifter_currents(self, currents: np.ndarray):
         """
@@ -226,7 +256,7 @@ class UniversalPhotonicProcessor:
         Parameters
         ----------
         currents : np.ndarray
-            1D array or list of current values (mA) to be applied. 
+            1D array or list of current values (mA) to be applied.
             The length must match the number of shifters N(N-1).
 
         Raises
@@ -238,7 +268,6 @@ class UniversalPhotonicProcessor:
             raise RuntimeError("[UPP] Electrical hardware (Qontrol) not initialized.")
         self.drv.set_current(self.shifter_map, currents)
 
-
     def set_all_zero(self):
         """
         Set all phase shifter currents to zero.
@@ -249,10 +278,9 @@ class UniversalPhotonicProcessor:
             If electrical hardware (Qontrol) has not been initialized.
         """
         if not self.drv:
-             raise RuntimeError("[UPP] Electrical hardware (Qontrol) not initialized.")
+            raise RuntimeError("[UPP] Electrical hardware (Qontrol) not initialized.")
         self.drv.set_all_zero()
-         
-        
+
     def close(self):
         """
         Release only initialized hardware resources.
