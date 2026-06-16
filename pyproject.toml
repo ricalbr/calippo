@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=42.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+addopts = "-p no:logging --cov=src --cov-report=json --cov-report=html"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
+testpaths = "tests"
+# timeout = 30
+
+[tool.mypy]
+mypy_path = "src"
+ignore_missing_imports = true
+
+[tool.black]
+line-length = 120
+skip-string-normalization = true
+
+[tool.isort]
+profile = "black"
