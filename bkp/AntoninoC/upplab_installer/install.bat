@@ -1,0 +1,1 @@
+python -m pip install E:\python\work\upplab_installer
