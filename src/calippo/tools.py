@@ -29,9 +29,7 @@ import numpy as np
 from typing import Tuple
 
 
-def sinkhorn(
-    U: np.ndarray, tol: float = 1e-6, max_iter: int = 1000
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def sinkhorn(U: np.ndarray, tol: float = 1e-6, max_iter: int = 1000) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Normalize a (batch of) positive matrices using the Sinkhorn–Knopp algorithm.
 
@@ -243,10 +241,7 @@ def get_haar_unitary(size: int, batch_size: int = 1) -> np.ndarray:
     """
     # Generate random complex matrices: (B, N, N).
     # Using standard normal distribution for real and imaginary parts
-    X = (
-        np.random.randn(batch_size, size, size)
-        + 1j * np.random.randn(batch_size, size, size)
-    ) / np.sqrt(2)
+    X = (np.random.randn(batch_size, size, size) + 1j * np.random.randn(batch_size, size, size)) / np.sqrt(2)
 
     # QR decomposition (vectorized over the first dimension)
     # np.linalg.qr returns Q and R. Q is unitary.
@@ -278,9 +273,7 @@ if __name__ == "__main__":
     noise_intensity = 0.1
 
     # HAAR VALIDATION
-    print(
-        f"--- Statistical Verification of Haar Distribution (N={size}, Batch Size: {batch_size}) ---"
-    )
+    print(f"--- Statistical Verification of Haar Distribution (N={size}, Batch Size: {batch_size}) ---")
     U_batch = get_haar_unitary(size, batch_size)
 
     # Dimensional promotion for 3D testing to avoid shape errors
@@ -320,9 +313,7 @@ if __name__ == "__main__":
     plt.show()
 
     # OTHER TOOL VALIDATION
-    print(
-        f"\n--- Matrix Normalization and Fidelity Test (N={size}, Batch Size: {batch_size}) ---"
-    )
+    print(f"\n--- Matrix Normalization and Fidelity Test (N={size}, Batch Size: {batch_size}) ---")
 
     # 1. Create target random Haar matrices
     U_target = get_haar_unitary(size, batch_size=batch_size)
@@ -330,13 +321,10 @@ if __name__ == "__main__":
     # 2. Add noise
     # Maintain the dimensional symmetry of the noise based on the target.
     if U_target.ndim == 2:
-        noise = (
-            np.random.randn(size, size) + 1j * np.random.randn(size, size)
-        ) * noise_intensity
+        noise = (np.random.randn(size, size) + 1j * np.random.randn(size, size)) * noise_intensity
     else:
         noise = (
-            np.random.randn(batch_size, size, size)
-            + 1j * np.random.randn(batch_size, size, size)
+            np.random.randn(batch_size, size, size) + 1j * np.random.randn(batch_size, size, size)
         ) * noise_intensity
 
     U_noisy = U_target + noise
@@ -346,9 +334,7 @@ if __name__ == "__main__":
     U_norm_power, _, _ = sinkhorn(U_power)
 
     # Dimensional promotion for safe row/col sums
-    U_norm_test = (
-        U_norm_power[np.newaxis, ...] if U_norm_power.ndim == 2 else U_norm_power
-    )
+    U_norm_test = U_norm_power[np.newaxis, ...] if U_norm_power.ndim == 2 else U_norm_power
     max_row_err = np.max(np.abs(np.sum(U_norm_test, axis=2) - 1.0))
     max_col_err = np.max(np.abs(np.sum(U_norm_test, axis=1) - 1.0))
     print(f"Sinkhorn Max Row Error:    {max_row_err:.2e}")

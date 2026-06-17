@@ -80,9 +80,7 @@ class Mesh(ABC):
         if calibration_file is not None:
             self.static_phases, self.xtalk = self.import_calibration(calibration_file)
         else:
-            self.static_phases, self.xtalk = self.generate_random_calibration(
-                1.0, 2 * np.pi
-            )
+            self.static_phases, self.xtalk = self.generate_random_calibration(1.0, 2 * np.pi)
 
         # Output
         msg = (
@@ -127,15 +125,11 @@ class Mesh(ABC):
 
         # Input validation
         if calibration["N"] != self.n_modes:
-            raise ValueError(
-                f"Calibration size mismatch: expected {self.n_modes} modes, "
-                f"found {calibration['N']}."
-            )
+            raise ValueError(f"Calibration size mismatch: expected {self.n_modes} modes, " f"found {calibration['N']}.")
 
         if calibration["n_heaters"] != self.n_phases:
             raise ValueError(
-                f"Calibration size mismatch: expected {self.n_phases} phases, "
-                f"found {calibration['n_heaters']}."
+                f"Calibration size mismatch: expected {self.n_phases} phases, " f"found {calibration['n_heaters']}."
             )
 
         # Fetch dataset
@@ -178,21 +172,14 @@ class Mesh(ABC):
             noise = xtalk_ampl / 10.0
 
         # Build dataset
-        static_phases = np.mod(
-            np.random.rand(self.n_phases) * static_phases_ampl, 2 * np.pi
-        )
+        static_phases = np.mod(np.random.rand(self.n_phases) * static_phases_ampl, 2 * np.pi)
         static_phases = static_phases * self.static_phases_mask
-        xtalk = (
-            np.eye(self.n_phases) * xtalk_ampl
-            + (np.random.rand(self.n_phases, self.n_phases) - 0.5) * noise
-        )
+        xtalk = np.eye(self.n_phases) * xtalk_ampl + (np.random.rand(self.n_phases, self.n_phases) - 0.5) * noise
         xtalk = xtalk * self.xtalk_mask
 
         return static_phases, xtalk
 
-    def generate_random_currents(
-        self, current_ampl: float, batch_size: Optional[int] = None
-    ) -> nparray:
+    def generate_random_currents(self, current_ampl: float, batch_size: Optional[int] = None) -> nparray:
         """
         Generate random currents in mA. Supports single vectors or batches.
 
@@ -353,9 +340,7 @@ class Clements(Mesh):
         **kwargs,
     ) -> nparray:
 
-        _, Tlist = self.rectangular_MZ(
-            U=U_target, tol=target_infidelity, rearrange=True
-        )
+        _, Tlist = self.rectangular_MZ(U=U_target, tol=target_infidelity, rearrange=True)
         a = list()
         for t in Tlist:
             _, _, theta, phi, _ = t
@@ -507,11 +492,7 @@ class Clements(Mesh):
             m, n, theta, _, nmax = T
             r = -localU[m, m] / localU[m, n]
             # theta = 2 * np.arctan(np.abs(r)) if not np.isclose(np.abs(r), 0.0) else np.pi
-            phi = (
-                (np.angle(r) + np.pi) % (2 * np.pi)
-                if not np.isclose(np.abs(r), 0.0)
-                else 0.0
-            )
+            phi = (np.angle(r) + np.pi) % (2 * np.pi) if not np.isclose(np.abs(r), 0.0) else 0.0
 
             invT = self.mach_zehnder_inv(m, n, theta, phi, nmax)
             localU = localU @ invT
@@ -585,7 +566,7 @@ class Bell(Mesh):
         static_phases_mask[0, ::2] = 1
         static_phases_mask[-1, :] = 0  # In the last layer we act only on the odd ones
         static_phases_mask[-1, 1::2] = 1
-        static_phases_mask = static_phases_mask.reshape(-1).astype( bool)  # Reshape into 1D array of bool
+        static_phases_mask = static_phases_mask.reshape(-1).astype(bool)  # Reshape into 1D array of bool
 
         # Mask for cross-talk coefficients
         xtalk_mask = np.ones(
@@ -611,14 +592,10 @@ class Bell(Mesh):
             A tuple containing the number of mixing layers (int) and
             the 3D array of matrices M (np.ndarray).
         """
-        n_mixing_layers = (
-            self.n_modes + 1
-        )  # Number of mixing layers (EXCLUDING the phase blocks)
+        n_mixing_layers = self.n_modes + 1  # Number of mixing layers (EXCLUDING the phase blocks)
         refl = 0.5
         trasm = 1.0 - refl
-        BS = np.array(
-            [[np.sqrt(trasm), 1j * np.sqrt(refl)], [1j * np.sqrt(refl), np.sqrt(trasm)]]
-        )
+        BS = np.array([[np.sqrt(trasm), 1j * np.sqrt(refl)], [1j * np.sqrt(refl), np.sqrt(trasm)]])
 
         # First kind of beam-splitter layer (V1)
         V1 = BS
@@ -675,9 +652,7 @@ class Bell(Mesh):
 
         # Input validation
         if phases.shape[-1] != self.n_phases:
-            raise ValueError(
-                f"Dimension mismatch: expected {self.n_phases} elements, found {phases.shape[-1]}."
-            )
+            raise ValueError(f"Dimension mismatch: expected {self.n_phases} elements, found {phases.shape[-1]}.")
 
         B = phases.shape[0]
         # (B, N, N) identity array
@@ -745,22 +720,16 @@ class Bell(Mesh):
 
         # Useful definitions
         B = U_target.shape[0]
-        n_matrices = (
-            self.n_mixing_layers + 1
-        )  # Number of mixing matrices + the inverse of the target
+        n_matrices = self.n_mixing_layers + 1  # Number of mixing matrices + the inverse of the target
 
         # Array of mixing matrices with inv_target at the end, over B batches
-        v_matrices = np.zeros(
-            (B, n_matrices, self.n_modes, self.n_modes), dtype=complex
-        )
+        v_matrices = np.zeros((B, n_matrices, self.n_modes, self.n_modes), dtype=complex)
         v_matrices[:, :-1] = self.M
         v_matrices[:, -1] = U_target.conj().transpose(0, 2, 1)
 
         # Phase terms are introduced before each V matrix in this
         # decomposition; they are here initialized to random values
-        phase_terms = np.exp(
-            1j * np.random.rand(B, self.n_modes + 2, self.n_modes) * 2 * np.pi
-        )
+        phase_terms = np.exp(1j * np.random.rand(B, self.n_modes + 2, self.n_modes) * 2 * np.pi)
 
         # Start the iterative decomposition
         print(f"Iterative phases optimization (Batch size: {B})")
@@ -772,12 +741,8 @@ class Bell(Mesh):
 
             # Calculates the matrix product
             for ii in range(n_matrices):
-                buffer_matrix = (
-                    buffer_matrix * phase_terms[:, ii, :][:, :, np.newaxis]
-                )  # First phases (multiply rows)
-                buffer_matrix = (
-                    v_matrices[:, ii, :, :] @ buffer_matrix
-                )  # Then mixing matrix
+                buffer_matrix = buffer_matrix * phase_terms[:, ii, :][:, :, np.newaxis]  # First phases (multiply rows)
+                buffer_matrix = v_matrices[:, ii, :, :] @ buffer_matrix  # Then mixing matrix
 
             # Vectorized fidelity check (Trace over inner axes)
             trace_b = np.trace(buffer_matrix, axis1=1, axis2=2)
@@ -795,9 +760,7 @@ class Bell(Mesh):
             # If not, it performs another update cycle of all matrices
             for ii in range(n_matrices):
                 # Multiplication along columns to expose phases
-                buffer_matrix = (
-                    buffer_matrix * phase_terms[:, ii, :].conj()[:, np.newaxis, :]
-                )
+                buffer_matrix = buffer_matrix * phase_terms[:, ii, :].conj()[:, np.newaxis, :]
 
                 # Update phase list
                 diagonal = np.diagonal(buffer_matrix, axis1=1, axis2=2).conj()
@@ -808,18 +771,14 @@ class Bell(Mesh):
 
                 # Removes next mixing layer
                 buffer_matrix = (
-                    v_matrices[:, ii, :, :]
-                    @ buffer_matrix
-                    @ v_matrices[:, ii, :, :].conj().transpose(0, 2, 1)
+                    v_matrices[:, ii, :, :] @ buffer_matrix @ v_matrices[:, ii, :, :].conj().transpose(0, 2, 1)
                 )
 
         print(f"--- Elapsed time: {(time.time() - start_time):.2f} seconds.")
 
         # Vectorized cleanup and restoration
         phase_terms = np.angle(phase_terms)  # Phases are now real numbers
-        phase_terms = (
-            phase_terms - phase_terms[:, :, -1][:, :, np.newaxis]
-        )  # Subtract the phase of the last mode
+        phase_terms = phase_terms - phase_terms[:, :, -1][:, :, np.newaxis]  # Subtract the phase of the last mode
         phase_terms = phase_terms[:, 1:-1, :]  # Remove external phases
         phase_terms[:, 0, ::2] -= phase_terms[:, 0, 1::2]  # First layer only even modes
         phase_terms[:, 0, 1::2] = 0.0
@@ -855,7 +814,10 @@ if __name__ == "__main__":
 
     n = 6
     batch_size = 1
-    processor = Bell( n_modes=n, calibration_file="./data/20260213_model_large_parameters_noBSerr.pickle",)
+    processor = Bell(
+        n_modes=n,
+        calibration_file="./data/20260213_model_large_parameters_noBSerr.pickle",
+    )
     processor = Bell(n_modes=n)
 
     print(f"\n--- Batch Testing ({batch_size} unitaries simultaneously) ---")
@@ -868,9 +830,7 @@ if __name__ == "__main__":
     start_t = time.time()
     phases_target = processor.phases_from_U(u_target, plot_graph=True)
     currents_target = processor.currents_from_phases(phases_target)
-    print(
-        f"-> Decomposition and current calculation completed in {time.time()-start_t:.3f}s"
-    )
+    print(f"-> Decomposition and current calculation completed in {time.time()-start_t:.3f}s")
 
     # 3. Vectorized Forward Propagation
     phases_exp = processor.phases_from_currents(currents_target)

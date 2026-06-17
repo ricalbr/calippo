@@ -110,32 +110,18 @@ class UniversalPhotonicProcessor:
         self.UPP_transient = UPP_transient
 
         # Setup optical and electrical mapping
-        self.input_map = (
-            switch_channels if switch_channels else list(range(1, num_modes + 1))
-        )
-        self.output_map = (
-            opm_channels if opm_channels else list(range(1, num_modes + 1))
-        )
-        self.shifter_map = (
-            shifter_channels
-            if shifter_channels
-            else list(range(0, num_modes * (num_modes - 1)))
-        )
+        self.input_map = switch_channels if switch_channels else list(range(1, num_modes + 1))
+        self.output_map = opm_channels if opm_channels else list(range(1, num_modes + 1))
+        self.shifter_map = shifter_channels if shifter_channels else list(range(0, num_modes * (num_modes - 1)))
 
         if len(self.input_map) != num_modes or len(self.output_map) != num_modes:
-            raise ValueError(
-                "[UPP][ERROR] Optical mapping lists must match number of modes N."
-            )
+            raise ValueError("[UPP][ERROR] Optical mapping lists must match number of modes N.")
         if len(self.shifter_map) != num_modes * (num_modes - 1):
-            raise ValueError(
-                "[UPP][ERROR] Electrical mapping lists must match number of shifters N(N-1)."
-            )
+            raise ValueError("[UPP][ERROR] Electrical mapping lists must match number of shifters N(N-1).")
 
         # Initialize Hardware 1 & 2: Fiber Switch and Power Meter (Optional)
         if switch_resource:
-            self.switch = FiberSwitch(
-                switch_resource, transient=self.switch_transient, verbose=verbose
-            )
+            self.switch = FiberSwitch(switch_resource, transient=self.switch_transient, verbose=verbose)
             self.pm = OPM150(power_unit=1, verbose=verbose)
             self.pm.wavelength = wavelength_nm
             self.pm.autorange_all(True)
@@ -174,9 +160,7 @@ class UniversalPhotonicProcessor:
         if not self.switch or not self.pm:
             raise RuntimeError("[UPP] Optical hardware (switch/OPM) not initialized.")
         if self.verbose:
-            print(
-                f"[UPP] Measuring the transmission on the {self.num_modes} input modes..."
-            )
+            print(f"[UPP] Measuring the transmission on the {self.num_modes} input modes...")
         power_matrix = np.zeros((self.num_modes, self.num_modes))
         for i, ch_in in enumerate(self.input_map):
             self.switch.set_channel(ch_in)
@@ -201,9 +185,7 @@ class UniversalPhotonicProcessor:
             If optical hardware (switch/OPM) has not been initialized.
         """
         if not self.switch or not self.pm:
-            raise RuntimeError(
-                "[UPP][ERROR] Optical hardware (switch/OPM) not initialized."
-            )
+            raise RuntimeError("[UPP][ERROR] Optical hardware (switch/OPM) not initialized.")
         power_matrix = self.measure_power_matrix()
         if self.verbose:
             print("[UPP] ... Normalizing...")
@@ -230,18 +212,13 @@ class UniversalPhotonicProcessor:
             If electrical hardware (Qontrol) has not been initialized.
         """
         if not self.drv:
-            raise RuntimeError(
-                "[UPP][ERROR] Electrical hardware (Qontrol) not initialized."
-            )
+            raise RuntimeError("[UPP][ERROR] Electrical hardware (Qontrol) not initialized.")
         if self.verbose:
             print(f"[UPP] Measuring resistance for {len(self.shifter_map)} shifters...")
         try:
-            self.drv.set_current(
-                self.shifter_map, [test_current] * len(self.shifter_map)
-            )
+            self.drv.set_current(self.shifter_map, [test_current] * len(self.shifter_map))
             resistances = (
-                np.array(self.drv.voltage)[self.shifter_map]
-                / np.array(self.drv.current)[self.shifter_map]
+                np.array(self.drv.voltage)[self.shifter_map] / np.array(self.drv.current)[self.shifter_map]
             ) * 1000.0
         finally:
             self.drv.set_all_zero()
