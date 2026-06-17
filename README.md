@@ -4,8 +4,9 @@ CALIbration of Photonics PrOcessors
 - [Installation](#installation)
 - [Issues](#issues)
 
-## Installation 
-The package can be installed using `pip` (`Python 3.11` or above are suggested)
+## Installation
+The package can be installed using `pip` (Python version `3.11` or above is suggested)
+
 ```bash
 python3 -m venv .venvs/cal
 source .venvs/cal/bin/activate
