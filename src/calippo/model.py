@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+
 """
 Created on Thu Jun 11 16:07:49 2026
 
@@ -33,13 +33,9 @@ import pickle
 from abc import ABC, abstractmethod
 from typing import Optional
 import numpy.typing as npt
+import dataclasses
 
 nparray = npt.NDArray
-
-
-###############################################################################
-#                           BASE ABSTRACT CLASS                               #
-###############################################################################
 
 
 class Mesh(ABC):
@@ -314,9 +310,22 @@ class Mesh(ABC):
         pass
 
 
-###############################################################################
-#                               CLASS CLEMENTS                                #
-###############################################################################
+@dataclasses.dataclass
+class MZIOp:
+    """
+    One batched MZI operation  W ← W @ T(m,n,θ,φ)^†.
+
+    Attributes
+    ----------
+    m, n  : column indices of the 2×2 block  (m = n-1)
+    theta : internal (splitting) phase, shape (M,)
+    phi   : external phase,              shape (M,)
+    """
+
+    m: int
+    n: int
+    theta: nparray[np.float64]
+    phi: nparray[np.float64]
 
 
 class Clements(Mesh):
@@ -347,189 +356,428 @@ class Clements(Mesh):
             a.append([theta, phi])
         return np.array(a)
 
-    def mach_zehnder(
-        self, m: int, n: int, internal_phase: float, external_phase: float, nmax: int
-    ) -> npt.NDArray[np.complex128]:
-        """A two-mode Mach-Zehnder interferometer section (Clements style).
+    @staticmethod
+    def mzi_matrix(
+        m: int,
+        n: int,
+        theta: nparray[np.float64],
+        phi: nparray[np.float64],
+        N: int,
+    ) -> nparray[np.complex128]:
+        """Build a batch of N×N MZI unitary matrices.
 
-        Calculated directly using the closed-form matrix representation.
+        The non-trivial 2×2 block at column indices (m, n) with n = m+1 is:
+
+        .. code-block:: none
+
+            T[m,m] =  i·exp(iθ/2)·sin(θ/2)·exp(iφ)
+            T[m,n] =  i·exp(iθ/2)·cos(θ/2)
+            T[n,m] =  i·exp(iθ/2)·cos(θ/2)·exp(iφ)
+            T[n,n] = -i·exp(iθ/2)·sin(θ/2)
+
+        All other diagonal entries are 1, off-diagonal entries are 0.
+
+        Parameters
+        ----------
+        m : int
+            Index of the first affected mode.
+        n : int
+            Index of the second affected mode (n = m+1).
+        theta : nparray[np.float64], shape (M,)
+            Internal phase angles.
+        phi : nparray[np.float64], shape (M,)
+            External phase angles.
+        N : int
+            Matrix size.
+
+        Returns
+        -------
+        nparray[np.complex128], shape (N, N, M)
+            Batch of MZI unitary matrices.
         """
-        mat = np.identity(nmax, dtype=np.complex128)
 
-        g = 1j * np.exp(1j * internal_phase / 2)
-        s, c = np.sin(internal_phase / 2), np.cos(internal_phase / 2)
-        e_ext = np.exp(1j * external_phase)
+        M = theta.shape[0]
+        T = np.zeros((N, N, M), dtype=np.complex128)
+        T[np.arange(N), np.arange(N), :] = 1.0  # identity baseline
 
-        mat[m, m] = g * s * e_ext
-        mat[m, n] = g * c
-        mat[n, m] = g * c * e_ext
-        mat[n, n] = -g * s
-        return np.round(mat, 14)
+        g = 1j * np.exp(1j * theta / 2)
+        s = np.sin(theta / 2)
+        c = np.cos(theta / 2)
+        e = np.exp(1j * phi)
 
-    def mach_zehnder_inv(self, m, n, phi_int, phi_ext, nmax):
-        r"""The inverse of the Mach-Zehnder unitary matrix.
-        See :func:`~.mach_zehnder` for more details on the Mach-Zehnder unitary.
-        """
-        return self.mach_zehnder(m, n, phi_int, phi_ext, nmax).conj().T
+        T[m, m, :] = g * s * e
+        T[m, n, :] = g * c
+        T[n, m, :] = g * c * e
+        T[n, n, :] = -g * s
+        return T
 
     @staticmethod
-    def nullMZi(m, n, U):
-        r"""Nullifies element m,n of U using mach_zehnder_inv.
-
-        Args:
-            m (int): row index of element to be nullified
-            n (int): column index of element to be nullified
-            U (array): matrix whose m,n element is to be nullified
-
-        Returns:
-            list: list containing ``[m, n, internal_phase, external_phase, nmax]`` of the
-                mach_zehnder_inv unitaries needed
+    def mzi_matrix_dag(
+        m: int,
+        n: int,
+        theta: nparray[np.float64],
+        phi: nparray[np.float64],
+        N: int,
+    ) -> nparray[np.complex128]:
         """
-        nmax, mmax = U.shape
+        Compute the conjugate transpose of an MZI matrix batch.
 
-        if nmax != mmax:
-            raise ValueError("U must be a square matrix")
+        Parameters
+        ----------
+        m : int
+            Index of the first affected mode.
+        n : int
+            Index of the second affected mode (n = m+1).
+        theta : nparray[np.float64], shape (M,)
+            Internal phase angles.
+        phi : nparray[np.float64], shape (M,)
+            External phase angles.
+        N : int
+            Matrix size.
 
-        if U[m, n] == 0:  # no swaps for the identity-like case
-            phi_i = np.pi
-            phi_e = 0
-        elif U[m, n + 1] == 0:  # swap in the divide-by-zero case
-            phi_i = 0
-            phi_e = 0
-        else:
-            r = -U[m, n + 1] / U[m, n]
-            phi_i = 2 * np.arctan(np.abs(r))
-            phi_e = -np.angle(r) % (2 * np.pi)
-
-        return [n, n + 1, phi_i, phi_e, nmax]
+        Returns
+        -------
+        nparray[np.complex128], shape (N, N, M)
+            Conjugate transpose T(m, n, θ, φ)^†.
+        """
+        return np.conjugate(Clements.mzi_matrix(m, n, theta, phi, N)).transpose(1, 0, 2)
 
     @staticmethod
-    def nullMZ(n, m, U):
-        r"""Nullifies element n,m of U using mach_zehnder.
-
-        Args:
-            n (int): row index of element to be nullified
-            m (int): column index of element to be nullified
-            U (array): matrix whose m,n element is to be nullified
-
-        Returns:
-            list: list containing ``[m, n, internal_phase, external_phase, nmax]`` of the
-                mach_zehnder unitaries needed
+    def _bmm(A: nparray, B: nparray) -> nparray:
         """
-        nmax, mmax = U.shape
+        Batched matrix multiplication over a batch axis.
 
-        if nmax != mmax:
-            raise ValueError("U must be a square matrix")
+        Contracts the two spatial axes while keeping the batch axis M in place.
 
-        if U[n, m] == 0:  # no swaps for the identity-like case
-            phi_i = np.pi
-            phi_e = 0
-        elif U[n - 1, m] == 0:  # swap in the divide-by-zero case
-            phi_i = 0
-            phi_e = 0
-        else:
-            r = U[n - 1, m] / U[n, m]
-            phi_i = 2 * np.arctan(np.abs(r))
-            phi_e = -np.angle(r) % (2 * np.pi)
+        Parameters
+        ----------
+        A : nparray, shape (N, N, M)
+            First operand.
+        B : nparray, shape (N, N, M)
+            Second operand.
 
-        return [n - 1, n, phi_i, phi_e, nmax]
-
-    def rectangular_MZ(self, U, tol: float = 1e-11, rearrange: bool = False):
-        r"""Rectangular decomposition of a unitary matrix, with local
-        phase shifts applied between two interferometers.
-
-        Is similar to :func:`~.rectangular` except that it uses Mach Zehnder matrices to null elements of V
-        using the :func:`~.null_MZ` and :func:`~.null_MZi` instead of :func:`~.T` matrices and corresponding :func:`~.nullT`
-        and :func:`~.nullTi` functions.
-
-        Args:
-            V (array[complex]): unitary matrix of size n_size
-            tol (float): the tolerance used when checking if the matrix is unitary
-
-        Returns:
-            tuple[array]: tuple of the form ``(tilist, np.diag(localV), tlist)``
-            where:
-
-            * ``tilist``: list containing ``[n,m,phi_int,phi_ext,n_size]`` of the ``mach_zehnder_inv`` unitaries needed
-            * ``tlist``: list containing ``[n,m,phi_int,phi_ext,n_size]`` of the ``mach_zehnder`` unitaries needed
-            * ``localV``: Diagonal unitary sitting sandwiched by ``mach_zehnder_inv``'s and the ``mach_zehnder``'s
+        Returns
+        -------
+        nparray, shape (N, N, M)
+            Result of the batched product A @ B.
         """
-        localU = U
-        nsize, _ = localU.shape
+        return np.einsum("ijk,jlk->ilk", A, B)
 
-        if not np.allclose(U @ U.conj().T, np.identity(nsize), atol=tol, rtol=0):
-            raise ValueError("The input matrix is not unitary")
+    @staticmethod
+    def _phases_null_right(row: int, col: int, W: nparray) -> tuple:
+        """
+        Solve for (theta, phi) such that (W @ T^†)[row, col] = 0.
 
-        tilist = []
-        tlist = []
-        for k, i in enumerate(range(nsize - 2, -1, -1)):
+        T^† acts on column pair (col, col+1). The annihilation condition is:
+
+        .. code-block:: none
+
+            W[row, col] · conj(T[col, col]) + W[row, col+1] · conj(T[col, col+1]) = 0
+
+        Substituting the MZI entries and simplifying gives the ratio:
+
+        .. code-block:: none
+
+            r = -W[row, col+1] / W[row, col]
+            theta = 2·arctan|r|,   phi = -angle(r)
+
+        Parameters
+        ----------
+        row : int
+            Row index of the element to annihilate.
+        col : int
+            Column index of the element to annihilate.
+        W : nparray[np.complex128], shape (N, N, M)
+            Current working matrix batch.
+
+        Returns
+        -------
+        theta : nparray[np.float64], shape (M,)
+            Internal phase angles in [0, 2π).
+        phi : nparray[np.float64], shape (M,)
+            External phase angles in [0, 2π).
+        """
+
+        a = W[row, col, :]  # element to annihilate, shape (M,)
+        b = W[row, col + 1, :]  # neighbouring column,   shape (M,)
+
+        M = a.shape[0]
+        theta = np.zeros(M, dtype=np.float64)
+        phi = np.zeros(M, dtype=np.float64)
+
+        zero_a = np.isclose(a, 0.0)  # already zero → identity-like
+        general = ~zero_a & ~np.isclose(b, 0.0)
+
+        theta[zero_a] = np.pi  # T(π,0) swaps and zeros correctly
+
+        if np.any(general):
+            r = -b[general] / a[general]
+            theta[general] = 2 * np.arctan(np.abs(r))
+            phi[general] = (-np.angle(r)) % (2 * np.pi)
+
+        return theta % (2 * np.pi), phi % (2 * np.pi)
+
+    @staticmethod
+    def _phases_null_left(row: int, col: int, W: nparray) -> tuple:
+        """
+        Solve for (theta, phi) such that (T @ W)[row+1, col] = 0.
+
+        T acts on row pair (row, row+1). The annihilation condition is:
+
+        .. code-block:: none
+
+            T[row+1, row] * W[row, col] + T[row+1, row+1] * W[row+1, col] = 0
+
+        Substituting the MZI entries and simplifying gives:
+
+        .. code-block:: none
+
+            r = +W[row, col] / W[row+1, col]
+            theta = 2·arctan|r|,   phi = -angle(r)
+
+        Parameters
+        ----------
+        row : int
+            Row index such that W[row+1, col] is the element to annihilate.
+        col : int
+            Column index of the element to annihilate.
+        W : nparray[np.complex128], shape (N, N, M)
+            Current working matrix batch.
+
+        Returns
+        -------
+        theta : nparray[np.float64], shape (M,)
+            Internal phase angles in [0, 2π).
+        phi : nparray[np.float64], shape (M,)
+            External phase angles in [0, 2π).
+        """
+
+        a = W[row + 1, col, :]  # element to annihilate, shape (M,)
+        b = W[row, col, :]  # neighbouring row,       shape (M,)
+
+        M = a.shape[0]
+        theta = np.zeros(M, dtype=np.float64)
+        phi = np.zeros(M, dtype=np.float64)
+
+        zero_a = np.isclose(a, 0.0)
+        general = ~zero_a & ~np.isclose(b, 0.0)
+
+        theta[zero_a] = np.pi
+
+        if np.any(general):
+            r = b[general] / a[general]
+            theta[general] = 2 * np.arctan(np.abs(r))
+            phi[general] = (-np.angle(r)) % (2 * np.pi)
+
+        return theta % (2 * np.pi), phi % (2 * np.pi)
+
+    @staticmethod
+    def _phi_left_to_right(
+        m: int,
+        n: int,
+        theta: nparray[np.float64],
+        W: nparray[np.complex128],
+    ) -> nparray[np.float64]:
+        """
+        Convert a left MZI op into an equivalent right MZI op.
+
+        After undoing the left-application (W ← T^† @ W), the matrix W has a
+        non-zero off-diagonal entry W[m, n]. Solves for phi_new such that:
+
+        .. code-block:: none
+
+            (W @ T(m, n, theta, phi_new)^†)[m, n] = 0
+
+        keeping theta unchanged. The condition simplifies to:
+
+        .. code-block:: none
+
+            r = -W[m, m] / W[m, n]
+            phi_new = (angle(r) + π) % 2π
+
+        Parameters
+        ----------
+        m : int
+            Index of the first affected mode.
+        n : int
+            Index of the second affected mode (n = m+1).
+        theta : nparray[np.float64], shape (M,)
+            Internal phase angles (unchanged from the original left op).
+        W : nparray[np.complex128], shape (N, N, M)
+            Working matrix batch after undoing the left application.
+
+        Returns
+        -------
+        nparray[np.float64], shape (M,)
+            New external phase angles phi_new for the equivalent right op.
+        """
+
+        M = W.shape[2]
+        phi_new = np.zeros(M, dtype=np.float64)
+
+        w_mm = W[m, m, :]
+        w_mn = W[m, n, :]
+
+        general = ~np.isclose(np.abs(w_mn), 0.0)
+        if np.any(general):
+            r = -w_mm[general] / w_mn[general]
+            phi_new[general] = (np.angle(r) + np.pi) % (2 * np.pi)
+
+        return phi_new
+
+    @staticmethod
+    def rearrange_clements(ops: list[MZIOp]) -> list[MZIOp]:
+        """
+        Reorder MZI ops to match the physical column layout of a Clements mesh.
+
+        In a Clements interferometer, MZIs acting on non-overlapping mode pairs
+        can run simultaneously in the same physical column. This function groups
+        ops into the earliest possible column via greedy layer assignment and
+        returns them in column-major order:
+
+        .. code-block:: none
+
+            col 0: m = 0, 2, 4, ...   (even-mode MZIs)
+            col 1: m = 1, 3, 5, ...   (odd-mode MZIs)
+            col 2: m = 0, 2, 4, ...
+            ...
+
+        .. warning::
+
+            The reordering is purely for physical layout reporting. It does
+            **not** preserve the matrix-product order, so the returned list
+            must **not** be used for reconstruction.
+
+        Parameters
+        ----------
+        ops : list[MZIOp]
+            MZI ops in computation order, as returned by ``clements_decompose``.
+
+        Returns
+        -------
+        list[MZIOp]
+            MZI ops in column-major (physical mesh) order.
+        """
+
+        if not ops:
+            return ops
+
+        # Greedy layer assignment: place each op in the first column where
+        # neither of its two modes is already occupied.
+        layers: list[list[int]] = []  # layers[col] = list of op indices
+
+        for i, op in enumerate(ops):
+            placed = False
+            for layer in layers:
+                occupied = {ops[j].m for j in layer} | {ops[j].n for j in layer}
+                if op.m not in occupied and op.n not in occupied:
+                    layer.append(i)
+                    placed = True
+                    break
+            if not placed:
+                layers.append([i])
+
+        return [ops[i] for layer in layers for i in layer]
+
+    def clements_decompose(
+        self,
+        U: nparray[np.complex128],
+        tol: float = 1e-11,
+    ) -> tuple[nparray[np.complex128], list[MZIOp]]:
+        """
+        Batched Clements decomposition of a unitary matrix batch.
+
+        Factorises each matrix in the batch as:
+
+        .. code-block:: none
+
+            U = D @ T_1 @ T_2 @ ... @ T_K
+
+        where D is a diagonal unitary and every T_k is a right-multiplication MZI.
+
+        **Pass 1** — standard Clements alternating sweep:
+
+        - Even diagonals: RIGHT ops  ``W ← W @ T^†``  (zero lower columns)
+        - Odd  diagonals: LEFT  ops  ``W ← T @ W``    (zero lower rows)
+
+        After this pass W is diagonal.
+
+        **Pass 2** — convert each LEFT op to an equivalent RIGHT op:
+
+        .. code-block:: none
+
+            W       ← T(theta, phi_old)^† @ W        # undo the left application
+            phi_new  = solve( (W @ T^†)[m,n] = 0 )   # same theta, new phi
+            W       ← W @ T(theta, phi_new)^†
+
+        The converted op is appended to right_ops.
+
+        Parameters
+        ----------
+        U : nparray[np.complex128], shape (N, N, M)
+            Batch of unitary matrices to decompose.
+        tol : float, optional
+            Absolute tolerance for the unitarity check. Default is 1e-11.
+
+        Returns
+        -------
+        D : nparray[np.complex128], shape (N, N, M)
+            Diagonal unitary batch.
+        right_ops : list[MZIOp]
+            All MZI ops in application order. Reconstruct with
+            ``U = D @ T_K @ ... @ T_1`` (reversed, using ``mzi_matrix`` not dag).
+
+        Raises
+        ------
+        ValueError
+            If one or more matrices in the batch are not unitary.
+        """
+
+        N, _, M = U.shape
+
+        # Unitarity check: U @ U^dag ~= I
+        UUd = self._bmm(U, np.conjugate(U).transpose(1, 0, 2))
+        I = np.zeros((N, N, M), dtype=np.complex128)
+        I[np.arange(N), np.arange(N), :] = 1.0
+        if not np.allclose(UUd, I, atol=tol, rtol=0):
+            raise ValueError("One or more matrices in the batch are not unitary.")
+
+        W: nparray[np.complex128] = U.copy()
+        right_ops: list[MZIOp] = []  # ops applied as  W <- W @ T^dag
+        left_ops: list[MZIOp] = []  # ops applied as  W <- T   @ W
+
+        for k, i in enumerate(range(N - 2, -1, -1)):
             if k % 2 == 0:
-                for j in reversed(range(nsize - 1 - i)):
-                    tilist.append(self.nullMZi(i + j + 1, j, localU))
-                    tilist[-1][2] %= 2 * np.pi
-                    tilist[-1][3] %= 2 * np.pi
-                    # repeat modulo operations, otherwise the input unitary
-                    # numpy.identity(20) yields an external_phase of exactly 2 * pi
-                    tilist[-1][2] %= 2 * np.pi
-                    tilist[-1][3] %= 2 * np.pi
-                    localU = localU @ self.mach_zehnder_inv(*tilist[-1])
+                # RIGHT ops: zero W[row, col] via  W <- W @ T(col, col+1)^dag
+                for j in reversed(range(N - 1 - i)):
+                    row, col = i + j + 1, j
+                    theta, phi = self._phases_null_right(row, col, W)
+                    right_ops.append(MZIOp(m=col, n=col + 1, theta=theta, phi=phi))
+                    W = self._bmm(W, self.mzi_matrix_dag(col, col + 1, theta, phi, N))
             else:
-                for j in range(nsize - 1 - i):
-                    tlist.append(self.nullMZ(i + j + 1, j, localU))
-                    tlist[-1][2] %= 2 * np.pi
-                    tlist[-1][3] %= 2 * np.pi
-                    # repeat modulo operations, otherwise the input unitary
-                    # numpy.identity(20) yields an external_phase of exactly 2 * pi
-                    tlist[-1][2] %= 2 * np.pi
-                    tlist[-1][3] %= 2 * np.pi
-                    localU = self.mach_zehnder(*tlist[-1]) @ localU
+                # LEFT ops: zero W[row+1, col] via  W <- T(row, row+1) @ W
+                for j in range(N - 1 - i):
+                    row, col = i + j, j
+                    theta, phi = self._phases_null_left(row, col, W)
+                    left_ops.append(MZIOp(m=row, n=row + 1, theta=theta, phi=phi))
+                    W = self._bmm(self.mzi_matrix(row, row + 1, theta, phi, N), W)
 
-        for T in reversed(tlist):
+        # W is diagonal
+        # Convert each LEFT op into an equivalent RIGHT op (batch).
+        for op in reversed(left_ops):
+            # Undo the left application
+            W = self._bmm(self.mzi_matrix_dag(op.m, op.n, op.theta, op.phi, N), W)
 
-            invT = self.mach_zehnder_inv(*T)
-            localU = invT @ localU
+            # Compute phi_new (batch) that re-zeroes W[m, n] via a right op
+            phi_new = self._phi_left_to_right(op.m, op.n, op.theta, W)
 
-            m, n, theta, _, nmax = T
-            r = -localU[m, m] / localU[m, n]
-            # theta = 2 * np.arctan(np.abs(r)) if not np.isclose(np.abs(r), 0.0) else np.pi
-            phi = (np.angle(r) + np.pi) % (2 * np.pi) if not np.isclose(np.abs(r), 0.0) else 0.0
+            # Apply the equivalent right op
+            W = self._bmm(W, self.mzi_matrix_dag(op.m, op.n, op.theta, phi_new, N))
 
-            invT = self.mach_zehnder_inv(m, n, theta, phi, nmax)
-            localU = localU @ invT
-            tilist.append([m, n, theta, phi, nmax])
+            right_ops.append(MZIOp(m=op.m, n=op.n, theta=op.theta, phi=phi_new))
 
-        if rearrange:
-            return localU, self.rearrange_clements(tilist)
-        else:
-            return localU, tilist
-
-    @staticmethod
-    def rearrange_clements(output: list[list]) -> list[list]:
-        """Reorder the list of beam splitters to match the physical mesh layout."""
-
-        N = len(output)
-        rearranged = output.copy()
-
-        for i in range(1, N - 1):
-            current_input = rearranged[i][0]
-            target_input = current_input + 2
-
-            # Max theoretical limit check based on even/odd mode parity
-            max_limit = N - 1 if current_input % 2 == 1 else N - 2
-
-            # Find the index of the next physical BS in the sequence
-            if current_input < max_limit and rearranged[i + 1][0] != target_input:
-                for j in range(i + 2, len(rearranged)):
-                    if rearranged[j][0] == target_input:
-                        # Move the found element right after the current one
-                        rearranged.insert(i + 1, rearranged.pop(j))
-                        break
-        return rearranged
-
-
-###############################################################################
-#                               CLASS BELL                                    #
-###############################################################################
+        # W is diagonal; right_ops contains all transformations.
+        return W, self.rearrange_clements(right_ops)
 
 
 class Bell(Mesh):
