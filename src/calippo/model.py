@@ -1058,13 +1058,13 @@ class Bell(Mesh):
 
 if __name__ == "__main__":
 
-    from tools import fidelity, get_haar_unitary, make_real_border
+    from calippo.tools import fidelity, get_haar_unitary, make_real_border
 
     n = 6
     batch_size = 1
     processor = Bell(
         n_modes=n,
-        calibration_file="./data/20260213_model_large_parameters_noBSerr.pickle",
+        calibration_file="BellOne/data/20260213_model_large_parameters_noBSerr.pickle",
     )
     processor = Bell(n_modes=n)
 

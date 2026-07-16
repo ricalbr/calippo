@@ -21,13 +21,13 @@ import numpy as np
 from typing import List, Optional
 
 # Hardware imports
-from LfiberSwtich import FiberSwitch
-from SantecOPM150 import OPM150
-from Qontrol import Q8iv
+from fastruments.LfiberSwtich import FiberSwitch
+from fastruments.SantecOPM150 import OPM150
+from fastruments.Qontrol import Q8iv
 
 # UPP imports
-from tools import sinkhorn
-from model import Bell, Clements
+from calippo.tools import sinkhorn
+from calippo.model import Bell, Clements
 
 
 class UniversalPhotonicProcessor:
