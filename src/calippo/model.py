@@ -132,9 +132,6 @@ class Mesh(ABC):
         static_phases = np.mod(calibration["static_phases"], 2 * np.pi)
         static_phases = static_phases * self.static_phases_mask
         xtalk = calibration["xt_matrix"]
-        print(xtalk)
-        plt.imshow(xtalk)
-        plt.show()
         xtalk = xtalk * self.xtalk_mask
 
         return static_phases, xtalk
@@ -334,14 +331,206 @@ class Clements(Mesh):
     """
 
     def _generate_masks(self) -> tuple[nparray, nparray]:
-        return np.array([0]), np.array([0])
+        """
+        Generate the boolean masks for the Clements architecture, specifying
+        which phases and cross-talk elements are physically implemented.
 
+        Returns
+        -------
+        tuple of np.ndarray
+            A tuple containing (static_phases_mask, xtalk_mask).
+        """
+        
+        # Generate static_phases_mask
+        static_phases_mask = np.ones(self.n_phases, dtype=int)
+        half_idx = self.n_phases // 2
+        static_phases_mask[half_idx : half_idx + self.n_modes - 1] = 0
+        static_phases_mask = static_phases_mask.astype(bool)
+        
+        # Initialize xtalk_mask
+        xtalk_mask = np.zeros((self.n_phases, self.n_phases), dtype=float)
+        
+        # Calculate main blocks for the first M rows (Thetas)
+        M = self.n_modes * (self.n_modes - 1) // 2
+        
+        B_sizes = []
+        for i in range(self.n_modes):
+            if i % 2 == 0:
+                B_sizes.append(self.n_modes // 2)
+            else:
+                B_sizes.append(self.n_modes // 2 - 1)
+                
+        B_starts = [0] + np.cumsum(B_sizes).tolist()[:-1]
+        
+        # Fill upper diagonal blocks
+        for i in range(self.n_modes):
+            start = B_starts[i]
+            end = start + B_sizes[i]
+            xtalk_mask[start:end, start:end] = 1.0
+            
+        G_sizes = B_sizes[:self.n_modes - 2]
+        if G_sizes:
+            G_starts = [0] + np.cumsum(G_sizes).tolist()[:-1]
+        
+        row_idx = M + self.n_modes - 1
+        
+        # Calculate dependencies for the lower rows (Phis)
+        for E in range(1, self.n_modes - 1):
+            for S in range(1, E + 1, 2): 
+                count = (self.n_modes // 2 - E // 2) if S == 1 else 1
+                
+                bl_col_start = B_starts[S]
+                bl_col_end = B_starts[E] + B_sizes[E]
+                
+                g_start_idx = max(0, S - 2)
+                g_end_idx = E - 1
+                br_col_start = M + self.n_modes - 1 + G_starts[g_start_idx]
+                br_col_end = M + self.n_modes - 1 + G_starts[g_end_idx] + G_sizes[g_end_idx]
+                
+                for _ in range(count):
+                    xtalk_mask[row_idx, bl_col_start:bl_col_end] = 1.0
+                    xtalk_mask[row_idx, br_col_start:br_col_end] = 1.0
+                    row_idx += 1
+                    
+        return static_phases_mask, xtalk_mask
+    
     def _generate_mixing_layers(self) -> tuple[int, nparray]:
-        return 0, np.array([0])
+        """
+        Generate the static mixing layers (directional couplers) for the Clements
+        architecture. Phase shift layer are excluded.
+
+        Returns
+        -------
+        tuple
+            A tuple containing the number of mixing layers (int) and
+            the 3D array of matrices M (np.ndarray).
+        """
+        n_mixing_layers = 2 * self.n_modes  # Number of mixing layers (EXCLUDING the phase blocks)
+        refl = 0.5
+        trasm = 1.0 - refl
+        BS = np.array([[np.sqrt(trasm), 1j * np.sqrt(refl)], [1j * np.sqrt(refl), np.sqrt(trasm)]])
+
+        # First kind of beam-splitter layer (V1)
+        V1 = BS
+        for ii in range(1, self.n_modes // 2):
+            V1 = sp.linalg.block_diag(V1, BS)
+
+        # Second kind of beam-splitter layer (V2)
+        V2 = np.array([[1]])
+        for ii in range(1, self.n_modes // 2):
+            V2 = sp.linalg.block_diag(V2, BS)
+        V2 = sp.linalg.block_diag(V2, np.array([[1]]))
+
+        # Array of matrices that describe the processor (mixing layers)
+        M = np.zeros((n_mixing_layers, self.n_modes, self.n_modes), dtype=complex)
+
+        # Populate M with the pattern: V1, V1, V2, V2 repeated        
+        for ii in range(n_mixing_layers):
+            if ii % 4 < 2:
+                M[ii, :, :] = V1
+            else:
+                M[ii, :, :] = V2
+
+        return n_mixing_layers, M
 
     def U_from_phases(self, phases: nparray) -> nparray:
-        return np.array([0])
+        """
+        Calculate the 2D unitary matrix representation of the processor on the
+        basis of the provided phase array.
 
+        Phases are split into internal (0 to n_phases/2 - 1) and 
+        external (n_phases/2 to n_phases). They are applied alternately across layers:
+            - Layer type 1 (V1): n_modes/2 external/internal phases (even positions, starting at mode 0)
+            - Layer type 2 (V2): n_modes/2 - 1 external/internal phases (odd positions, starting at mode 1)
+        
+        Parameters
+        ----------
+        phases : np.ndarray
+            Array of optical phases in rad. Shape (n_phases,) or (B, n_phases).
+
+        Returns
+        -------
+        np.ndarray
+            The complex unitary matrix resulting from the propagation.
+            Shape (n_modes, n_modes) or (B, n_modes, n_modes).
+
+        Raises
+        ------
+        ValueError
+            If the last dimension of the input array does not match the
+            expected number of phases for the mesh.
+        """
+        # Check dimension to guarantee vectorial shape
+        is_1d = phases.ndim == 1
+        if is_1d:
+            phases = phases[np.newaxis, :]
+
+        # Input validation
+        if phases.shape[-1] != self.n_phases:
+            raise ValueError(f"Dimension mismatch: expected {self.n_phases} elements, found {phases.shape[-1]}.")
+
+        B = phases.shape[0]
+        # (B, N, N) identity array
+        U = np.tile(np.eye(self.n_modes, dtype=complex), (B, 1, 1))
+
+        # Pointers for internal and external phases
+        int_ptr = 0
+        ext_ptr = self.n_phases // 2
+
+        # Sizes for each layer type
+        size_v1 = self.n_modes // 2
+        size_v2 = self.n_modes // 2 - 1
+
+        # Vectorized propagation
+        for ii in range(self.n_mixing_layers):
+            pattern_type = ii % 4
+            
+            if pattern_type == 0:
+                # 1st V1 layer: External phases, alternating starting from index 0
+                layer_phases = phases[:, ext_ptr : ext_ptr + size_v1]
+                ext_ptr += size_v1
+                
+                phase_multiplier = np.ones((B, self.n_modes), dtype=complex)
+                indices = np.arange(0, self.n_modes, 2)
+                phase_multiplier[:, indices] = np.exp(1j * layer_phases)
+                
+            elif pattern_type == 1:
+                # 2nd V1 layer: Internal phases, alternating starting from index 0
+                layer_phases = phases[:, int_ptr : int_ptr + size_v1]
+                int_ptr += size_v1
+                
+                phase_multiplier = np.ones((B, self.n_modes), dtype=complex)
+                indices = np.arange(0, self.n_modes, 2)
+                phase_multiplier[:, indices] = np.exp(1j * layer_phases)
+                
+            elif pattern_type == 2:
+                # 1st V2 layer: External phases, alternating starting with zero at index 1
+                layer_phases = phases[:, ext_ptr : ext_ptr + size_v2] if size_v2 > 0 else np.zeros((B, 0))
+                ext_ptr += size_v2
+                
+                phase_multiplier = np.ones((B, self.n_modes), dtype=complex)
+                if size_v2 > 0:
+                    indices = np.arange(1, self.n_modes - 1, 2)
+                    phase_multiplier[:, indices] = np.exp(1j * layer_phases)
+                
+            else: # pattern_type == 3
+                # 2nd V2 layer: Internal phases, alternating starting with zero at index 1
+                layer_phases = phases[:, int_ptr : int_ptr + size_v2] if size_v2 > 0 else np.zeros((B, 0))
+                int_ptr += size_v2
+                
+                phase_multiplier = np.ones((B, self.n_modes), dtype=complex)
+                if size_v2 > 0:
+                    indices = np.arange(1, self.n_modes - 1, 2)
+                    phase_multiplier[:, indices] = np.exp(1j * layer_phases)
+
+            # Broadcasting phase multiplier along rows: (B, N, 1)
+            U *= phase_multiplier[:, :, np.newaxis]
+
+            # Multiplication by the current mixing layer
+            U = self.M[ii] @ U
+
+        return U[0] if is_1d else U
+    
     def phases_from_U(
         self,
         U_target: nparray,
@@ -825,7 +1014,6 @@ class Bell(Mesh):
         xtalk_mask[0, ::2, ::2] = 1
         xtalk_mask[-1, 1::2, 1::2] = 1
         xtalk_mask = sp.linalg.block_diag(*xtalk_mask)  # Reshape into 2D array of bool
-        print(xtalk_mask)
 
         return static_phases_mask, xtalk_mask
 
@@ -859,6 +1047,7 @@ class Bell(Mesh):
         # Array of matrices that describe the processor (mixing layers)
         M = np.zeros((n_mixing_layers, self.n_modes, self.n_modes), dtype=complex)
 
+        # Populate M
         for ii in range(1, n_mixing_layers, 2):
             M[ii - 1, :, :] = V1 @ V2
             M[ii, :, :] = V2 @ V1
@@ -1062,11 +1251,7 @@ if __name__ == "__main__":
 
     n = 6
     batch_size = 1
-    processor = Bell(
-        n_modes=n,
-        calibration_file="BellOne/data/20260213_model_large_parameters_noBSerr.pickle",
-    )
-    processor = Bell(n_modes=n)
+    processor = Clements(n_modes=n)
 
     print(f"\n--- Batch Testing ({batch_size} unitaries simultaneously) ---")
 
