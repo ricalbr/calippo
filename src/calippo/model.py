@@ -340,60 +340,60 @@ class Clements(Mesh):
         tuple of np.ndarray
             A tuple containing (static_phases_mask, xtalk_mask).
         """
-        
+
         # Generate static_phases_mask
         static_phases_mask = np.ones(self.n_phases, dtype=int)
         half_idx = self.n_phases // 2
         static_phases_mask[half_idx : half_idx + self.n_modes - 1] = 0
         static_phases_mask = static_phases_mask.astype(bool)
-        
+
         # Initialize xtalk_mask
         xtalk_mask = np.zeros((self.n_phases, self.n_phases), dtype=float)
-        
+
         # Calculate main blocks for the first M rows (Thetas)
         M = self.n_modes * (self.n_modes - 1) // 2
-        
+
         B_sizes = []
         for i in range(self.n_modes):
             if i % 2 == 0:
                 B_sizes.append(self.n_modes // 2)
             else:
                 B_sizes.append(self.n_modes // 2 - 1)
-                
+
         B_starts = [0] + np.cumsum(B_sizes).tolist()[:-1]
-        
+
         # Fill upper diagonal blocks
         for i in range(self.n_modes):
             start = B_starts[i]
             end = start + B_sizes[i]
             xtalk_mask[start:end, start:end] = 1.0
-            
-        G_sizes = B_sizes[:self.n_modes - 2]
+
+        G_sizes = B_sizes[: self.n_modes - 2]
         if G_sizes:
             G_starts = [0] + np.cumsum(G_sizes).tolist()[:-1]
-        
+
         row_idx = M + self.n_modes - 1
-        
+
         # Calculate dependencies for the lower rows (Phis)
         for E in range(1, self.n_modes - 1):
-            for S in range(1, E + 1, 2): 
+            for S in range(1, E + 1, 2):
                 count = (self.n_modes // 2 - E // 2) if S == 1 else 1
-                
+
                 bl_col_start = B_starts[S]
                 bl_col_end = B_starts[E] + B_sizes[E]
-                
+
                 g_start_idx = max(0, S - 2)
                 g_end_idx = E - 1
                 br_col_start = M + self.n_modes - 1 + G_starts[g_start_idx]
                 br_col_end = M + self.n_modes - 1 + G_starts[g_end_idx] + G_sizes[g_end_idx]
-                
+
                 for _ in range(count):
                     xtalk_mask[row_idx, bl_col_start:bl_col_end] = 1.0
                     xtalk_mask[row_idx, br_col_start:br_col_end] = 1.0
                     row_idx += 1
-                    
+
         return static_phases_mask, xtalk_mask
-    
+
     def _generate_mixing_layers(self) -> tuple[int, nparray]:
         """
         Generate the static mixing layers (directional couplers) for the Clements
@@ -424,7 +424,7 @@ class Clements(Mesh):
         # Array of matrices that describe the processor (mixing layers)
         M = np.zeros((n_mixing_layers, self.n_modes, self.n_modes), dtype=complex)
 
-        # Populate M with the pattern: V1, V1, V2, V2 repeated        
+        # Populate M with the pattern: V1, V1, V2, V2 repeated
         for ii in range(n_mixing_layers):
             if ii % 4 < 2:
                 M[ii, :, :] = V1
@@ -438,11 +438,11 @@ class Clements(Mesh):
         Calculate the 2D unitary matrix representation of the processor on the
         basis of the provided phase array.
 
-        Phases are split into internal (0 to n_phases/2 - 1) and 
+        Phases are split into internal (0 to n_phases/2 - 1) and
         external (n_phases/2 to n_phases). They are applied alternately across layers:
             - Layer type 1 (V1): n_modes/2 external/internal phases (even positions, starting at mode 0)
             - Layer type 2 (V2): n_modes/2 - 1 external/internal phases (odd positions, starting at mode 1)
-        
+
         Parameters
         ----------
         phases : np.ndarray
@@ -484,40 +484,40 @@ class Clements(Mesh):
         # Vectorized propagation
         for ii in range(self.n_mixing_layers):
             pattern_type = ii % 4
-            
+
             if pattern_type == 0:
                 # 1st V1 layer: External phases, alternating starting from index 0
                 layer_phases = phases[:, ext_ptr : ext_ptr + size_v1]
                 ext_ptr += size_v1
-                
+
                 phase_multiplier = np.ones((B, self.n_modes), dtype=complex)
                 indices = np.arange(0, self.n_modes, 2)
                 phase_multiplier[:, indices] = np.exp(1j * layer_phases)
-                
+
             elif pattern_type == 1:
                 # 2nd V1 layer: Internal phases, alternating starting from index 0
                 layer_phases = phases[:, int_ptr : int_ptr + size_v1]
                 int_ptr += size_v1
-                
+
                 phase_multiplier = np.ones((B, self.n_modes), dtype=complex)
                 indices = np.arange(0, self.n_modes, 2)
                 phase_multiplier[:, indices] = np.exp(1j * layer_phases)
-                
+
             elif pattern_type == 2:
                 # 1st V2 layer: External phases, alternating starting with zero at index 1
                 layer_phases = phases[:, ext_ptr : ext_ptr + size_v2] if size_v2 > 0 else np.zeros((B, 0))
                 ext_ptr += size_v2
-                
+
                 phase_multiplier = np.ones((B, self.n_modes), dtype=complex)
                 if size_v2 > 0:
                     indices = np.arange(1, self.n_modes - 1, 2)
                     phase_multiplier[:, indices] = np.exp(1j * layer_phases)
-                
-            else: # pattern_type == 3
+
+            else:  # pattern_type == 3
                 # 2nd V2 layer: Internal phases, alternating starting with zero at index 1
                 layer_phases = phases[:, int_ptr : int_ptr + size_v2] if size_v2 > 0 else np.zeros((B, 0))
                 int_ptr += size_v2
-                
+
                 phase_multiplier = np.ones((B, self.n_modes), dtype=complex)
                 if size_v2 > 0:
                     indices = np.arange(1, self.n_modes - 1, 2)
@@ -530,7 +530,7 @@ class Clements(Mesh):
             U = self.M[ii] @ U
 
         return U[0] if is_1d else U
-    
+
     def phases_from_U(
         self,
         U_target: nparray,
