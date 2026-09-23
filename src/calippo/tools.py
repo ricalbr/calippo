@@ -24,13 +24,16 @@ make_real_border(U)
 get_haar_unitary(size, batch_size=1)
     Generate a complex random Haar-distributed unitary matrix or batch.
 """
+
 from __future__ import annotations
 
 import numpy as np
 import torch
 
 
-def sinkhorn(U: torch.Tensor, tol: float = 1e-6, max_iter: int = 1000) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def sinkhorn(
+    U: torch.Tensor, tol: float = 1e-6, max_iter: int = 1000
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Normalize a (batch of) positive matrices using the Sinkhorn–Knopp algorithm in PyTorch.
 
     The algorithm iteratively rescales rows and columns to make each matrix
@@ -88,7 +91,7 @@ def sinkhorn(U: torch.Tensor, tol: float = 1e-6, max_iter: int = 1000) -> tuple[
     return U_work, D_in, D_out
 
 
-def amplitude_fidelity(U_target: torch.Tensor, U_exp: torch.Tensor) -> torch.Tensor :
+def amplitude_fidelity(U_target: torch.Tensor, U_exp: torch.Tensor) -> torch.Tensor:
     """
     Calculate the amplitude fidelity between two complex matrices.
 
@@ -227,7 +230,6 @@ def get_haar_unitary(size: int, batch_size: int = 1, device: torch.device | str 
     return Q.to(dtype=torch.complex128)
 
 
-
 if __name__ == "__main__":
 
     import matplotlib.pyplot as plt
@@ -247,7 +249,7 @@ if __name__ == "__main__":
     # 1. Test Unitarity: U^H @ U should be I
     U_H = U_test.adjoint()
     identity_batch = torch.eye(size, dtype=U_test.dtype, device=U_test.device)
-    unitarity_diff = torch.bmm(U_H, U_test) - identity_batch 
+    unitarity_diff = torch.bmm(U_H, U_test) - identity_batch
     error_unitarity = torch.mean(torch.abs(unitarity_diff)).item()
     print(f"Mean Unitarity Error:      {error_unitarity:.2e}")
 
@@ -311,15 +313,11 @@ if __name__ == "__main__":
     # R is (B, N, N) or (N, N)
     R, _, _ = make_real_border(U_target)
     R_test = R
-    
+
     # Calculate the max sum of absolute imaginary parts on the first row and column
     # Sum over dimensions 1 or 2 (within each matrix), then extract max over the batch
-    imag_sum_row = torch.max(
-        torch.sum(torch.abs(torch.imag(R_test[:, 0, :])), dim=1)
-    ).item()
-    imag_sum_col = torch.max(
-        torch.sum(torch.abs(torch.imag(R_test[:, :, 0])), dim=1)
-    ).item()
+    imag_sum_row = torch.max(torch.sum(torch.abs(torch.imag(R_test[:, 0, :])), dim=1)).item()
+    imag_sum_col = torch.max(torch.sum(torch.abs(torch.imag(R_test[:, :, 0])), dim=1)).item()
 
     print("\n--- Real Border Test (Batch Average) ---")
     print(f"Residual imaginary sum (1st row): {imag_sum_row:.2e}")
