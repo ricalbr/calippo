@@ -25,15 +25,20 @@ Bell
 """
 
 from __future__ import annotations
-import numpy as np
-import scipy as sp
-import matplotlib.pyplot as plt
-import time
+
+import dataclasses
+import itertools
 import pickle
+import time
 from abc import ABC, abstractmethod
 from typing import Optional
+
+import matplotlib.pyplot as plt
+import numpy as np
 import numpy.typing as npt
-import dataclasses
+import scipy as sp
+import torch
+import torch.types
 
 nparray = npt.NDArray
 
@@ -263,6 +268,11 @@ class Mesh(ABC):
             If the last dimension of the input array does not match the
             expected number of phases for the mesh.
         """
+
+        # TODO: maybe remove this
+        if isinstance(phases, torch.Tensor):
+            phases = phases.numpy()
+
         # Check dimension to guarantee vectorial shape
         is_1d = phases.ndim == 1
         if is_1d:
@@ -315,14 +325,17 @@ class MZIOp:
     Attributes
     ----------
     m, n  : column indices of the 2×2 block  (m = n-1)
-    theta : internal (splitting) phase, shape (M,)
-    phi   : external phase,              shape (M,)
+    theta : internal (splitting) phase, shape (B,)
+    phi   : external phase, shape (B,)
     """
 
     m: int
     n: int
-    theta: nparray[np.float64]
-    phi: nparray[np.float64]
+    theta: torch.Tensor
+    phi: torch.Tensor
+
+    def __iter__(self):
+        return iter((self.m, self.n, self.theta, self.phi))
 
 
 class Clements(Mesh):
@@ -411,25 +424,20 @@ class Clements(Mesh):
         BS = np.array([[np.sqrt(trasm), 1j * np.sqrt(refl)], [1j * np.sqrt(refl), np.sqrt(trasm)]])
 
         # First kind of beam-splitter layer (V1)
-        V1 = BS
-        for ii in range(1, self.n_modes // 2):
-            V1 = sp.linalg.block_diag(V1, BS)
+        layer_mat = [BS] * (self.n_modes // 2)
+        V1 = sp.linalg.block_diag(*layer_mat)
 
         # Second kind of beam-splitter layer (V2)
-        V2 = np.array([[1]])
-        for ii in range(1, self.n_modes // 2):
-            V2 = sp.linalg.block_diag(V2, BS)
-        V2 = sp.linalg.block_diag(V2, np.array([[1]]))
+        layer_mat = [np.eye(1)] + [BS] * (self.n_modes // 2 - 1) + [np.eye(1)]
+        V2 = sp.linalg.block_diag(*layer_mat)
 
         # Array of matrices that describe the processor (mixing layers)
-        M = np.zeros((n_mixing_layers, self.n_modes, self.n_modes), dtype=complex)
+        M = np.zeros((n_mixing_layers, self.n_modes, self.n_modes), dtype=np.complex128)
 
         # Populate M with the pattern: V1, V1, V2, V2 repeated
-        for ii in range(n_mixing_layers):
-            if ii % 4 < 2:
-                M[ii, :, :] = V1
-            else:
-                M[ii, :, :] = V2
+        pattern = itertools.islice(itertools.cycle([V1, V1, V2, V2]), n_mixing_layers)
+        for ii, V in enumerate(pattern):
+            M[ii] = V
 
         return n_mixing_layers, M
 
@@ -471,7 +479,7 @@ class Clements(Mesh):
 
         B = phases.shape[0]
         # (B, N, N) identity array
-        U = np.tile(np.eye(self.n_modes, dtype=complex), (B, 1, 1))
+        U = np.tile(np.eye(self.n_modes, dtype=np.complex128), (B, 1, 1))
 
         # Pointers for internal and external phases
         int_ptr = 0
@@ -481,50 +489,33 @@ class Clements(Mesh):
         size_v1 = self.n_modes // 2
         size_v2 = self.n_modes // 2 - 1
 
-        # Vectorized propagation
+        idx_v1 = np.arange(0, self.n_modes, 2)
+        idx_v2 = np.arange(1, self.n_modes - 1, 2)
+
+        # Layer structure: (is_internal, size_v, indices)
+        layer_specs = [
+            (False, size_v1, idx_v1),  # pattern 0: V1 ext
+            (True, size_v1, idx_v1),  # pattern 1: V1 int
+            (False, size_v2, idx_v2),  # pattern 2: V2 ext
+            (True, size_v2, idx_v2),  # pattern 3: V2 int
+        ]
+
+        def consume_phases(phase_tensor, ptr, size):
+            return phase_tensor[:, ptr : ptr + size], ptr + size
+
         for ii in range(self.n_mixing_layers):
-            pattern_type = ii % 4
+            is_internal, size_v, indices = layer_specs[ii % 4]
 
-            if pattern_type == 0:
-                # 1st V1 layer: External phases, alternating starting from index 0
-                layer_phases = phases[:, ext_ptr : ext_ptr + size_v1]
-                ext_ptr += size_v1
+            if is_internal:
+                layer_phases, int_ptr = consume_phases(phases, int_ptr, size_v)
+            else:
+                layer_phases, ext_ptr = consume_phases(phases, ext_ptr, size_v)
 
-                phase_multiplier = np.ones((B, self.n_modes), dtype=complex)
-                indices = np.arange(0, self.n_modes, 2)
-                phase_multiplier[:, indices] = np.exp(1j * layer_phases)
-
-            elif pattern_type == 1:
-                # 2nd V1 layer: Internal phases, alternating starting from index 0
-                layer_phases = phases[:, int_ptr : int_ptr + size_v1]
-                int_ptr += size_v1
-
-                phase_multiplier = np.ones((B, self.n_modes), dtype=complex)
-                indices = np.arange(0, self.n_modes, 2)
-                phase_multiplier[:, indices] = np.exp(1j * layer_phases)
-
-            elif pattern_type == 2:
-                # 1st V2 layer: External phases, alternating starting with zero at index 1
-                layer_phases = phases[:, ext_ptr : ext_ptr + size_v2] if size_v2 > 0 else np.zeros((B, 0))
-                ext_ptr += size_v2
-
-                phase_multiplier = np.ones((B, self.n_modes), dtype=complex)
-                if size_v2 > 0:
-                    indices = np.arange(1, self.n_modes - 1, 2)
-                    phase_multiplier[:, indices] = np.exp(1j * layer_phases)
-
-            else:  # pattern_type == 3
-                # 2nd V2 layer: Internal phases, alternating starting with zero at index 1
-                layer_phases = phases[:, int_ptr : int_ptr + size_v2] if size_v2 > 0 else np.zeros((B, 0))
-                int_ptr += size_v2
-
-                phase_multiplier = np.ones((B, self.n_modes), dtype=complex)
-                if size_v2 > 0:
-                    indices = np.arange(1, self.n_modes - 1, 2)
-                    phase_multiplier[:, indices] = np.exp(1j * layer_phases)
+            phase_multiplier = np.ones((B, self.n_modes), dtype=np.complex128)
+            phase_multiplier[:, indices] = np.exp(1j * layer_phases)
 
             # Broadcasting phase multiplier along rows: (B, N, 1)
-            U *= phase_multiplier[:, :, np.newaxis]
+            U *= phase_multiplier[:, :, None]
 
             # Multiplication by the current mixing layer
             U = self.M[ii] @ U
@@ -533,27 +524,36 @@ class Clements(Mesh):
 
     def phases_from_U(
         self,
-        U_target: nparray,
+        U_target: torch.Tensor,
         target_infidelity: float = 1e-6,
         **kwargs,
     ) -> nparray:
 
-        _, Tlist = self.rectangular_MZ(U=U_target, tol=target_infidelity, rearrange=True)
-        a = list()
-        for t in Tlist:
-            _, _, theta, phi, _ = t
-            a.append([theta, phi])
-        return np.array(a)
+        _, Tlist = self.clements_decompose(U=U_target, tol=target_infidelity)
+
+        th = torch.stack([t.theta for t in Tlist], dim=1)
+        ph = torch.stack([t.phi for t in Tlist], dim=1)
+
+        phases = torch.cat([th, ph], dim=1)
+
+        # Remapping
+        phases[:, 20] -= phases[:, 18]  # Phase 20 -> 20 - 18
+        phases[:, 21] -= phases[:, 19]  # Phase 21 -> 21 - 19
+        phases[:, 23] -= phases[:, 19]  # Phase 23 -> 23 - 19
+        phases[:, 25] -= phases[:, 19]  # Phase 25 -> 25 - 19
+        # phases[:, 15:20] = 0            # Redundant phases, remapped
+
+        return phases
 
     @staticmethod
     def mzi_matrix(
         m: int,
         n: int,
-        theta: nparray[np.float64],
-        phi: nparray[np.float64],
+        theta: torch.Tensor,
+        phi: torch.Tensor,
         N: int,
-    ) -> nparray[np.complex128]:
-        """Build a batch of N×N MZI unitary matrices.
+    ) -> torch.Tensor:
+        """Build a batch (B) of N×N MZI unitary matrices.
 
         The non-trivial 2×2 block at column indices (m, n) with n = m+1 is:
 
@@ -572,42 +572,42 @@ class Clements(Mesh):
             Index of the first affected mode.
         n : int
             Index of the second affected mode (n = m+1).
-        theta : nparray[np.float64], shape (M,)
+        theta : torch.Tensor, shape (B,)
             Internal phase angles.
-        phi : nparray[np.float64], shape (M,)
+        phi : torch.Tensor, shape (B,)
             External phase angles.
         N : int
             Matrix size.
 
         Returns
         -------
-        nparray[np.complex128], shape (N, N, M)
+        torch.Tensor, shape (B, N, N)
             Batch of MZI unitary matrices.
         """
 
-        M = theta.shape[0]
-        T = np.zeros((N, N, M), dtype=np.complex128)
-        T[np.arange(N), np.arange(N), :] = 1.0  # identity baseline
+        B = theta.shape[0]
+        T = torch.eye(N, dtype=torch.complex128).unsqueeze(0).repeat(B, 1, 1)  # identity baseline
 
-        g = 1j * np.exp(1j * theta / 2)
-        s = np.sin(theta / 2)
-        c = np.cos(theta / 2)
-        e = np.exp(1j * phi)
+        j = torch.tensor(1j, device=theta.device)
+        g = j * torch.exp(j * theta / 2)
+        s = torch.sin(theta / 2)
+        c = torch.cos(theta / 2)
+        e = torch.exp(j * phi)
 
-        T[m, m, :] = g * s * e
-        T[m, n, :] = g * c
-        T[n, m, :] = g * c * e
-        T[n, n, :] = -g * s
+        T[:, m, m] = g * s * e
+        T[:, m, n] = g * c
+        T[:, n, m] = g * c * e
+        T[:, n, n] = -g * s
         return T
 
     @staticmethod
     def mzi_matrix_dag(
         m: int,
         n: int,
-        theta: nparray[np.float64],
-        phi: nparray[np.float64],
+        theta: torch.Tensor,
+        phi: torch.Tensor,
         N: int,
-    ) -> nparray[np.complex128]:
+    ) -> torch.Tensor:
         """
         Compute the conjugate transpose of an MZI matrix batch.
 
@@ -617,40 +617,19 @@ class Clements(Mesh):
             Index of the first affected mode.
         n : int
             Index of the second affected mode (n = m+1).
-        theta : nparray[np.float64], shape (M,)
+        theta : torch.Tensor, shape (B,)
             Internal phase angles.
-        phi : nparray[np.float64], shape (M,)
+        phi : torch.Tensor, shape (B,)
             External phase angles.
         N : int
             Matrix size.
 
         Returns
         -------
-        nparray[np.complex128], shape (N, N, M)
+        torch.Tensor, shape (B, N, N)
             Conjugate transpose T(m, n, θ, φ)^†.
         """
-        return np.conjugate(Clements.mzi_matrix(m, n, theta, phi, N)).transpose(1, 0, 2)
-
-    @staticmethod
-    def _bmm(A: nparray, B: nparray) -> nparray:
-        """
-        Batched matrix multiplication over a batch axis.
-
-        Contracts the two spatial axes while keeping the batch axis M in place.
-
-        Parameters
-        ----------
-        A : nparray, shape (N, N, M)
-            First operand.
-        B : nparray, shape (N, N, M)
-            Second operand.
-
-        Returns
-        -------
-        nparray, shape (N, N, M)
-            Result of the batched product A @ B.
-        """
-        return np.einsum("ijk,jlk->ilk", A, B)
+        return torch.adjoint(Clements.mzi_matrix(m, n, theta, phi, N))
 
     @staticmethod
     def _phases_null_right(row: int, col: int, W: nparray) -> tuple:
@@ -676,35 +655,35 @@ class Clements(Mesh):
             Row index of the element to annihilate.
         col : int
             Column index of the element to annihilate.
-        W : nparray[np.complex128], shape (N, N, M)
+        W : torch.Tensor, shape (B, N, N)
             Current working matrix batch.
 
         Returns
         -------
-        theta : nparray[np.float64], shape (M,)
+        theta : torch.Tensor, shape (B,)
             Internal phase angles in [0, 2π).
-        phi : nparray[np.float64], shape (M,)
+        phi : torch.Tensor, shape (B,)
             External phase angles in [0, 2π).
         """
 
-        a = W[row, col, :]  # element to annihilate, shape (M,)
-        b = W[row, col + 1, :]  # neighbouring column,   shape (M,)
+        a = W[:, row, col]  # element to annihilate, shape (B,)
+        b = W[:, row, col + 1]  # neighbouring column, shape (B,)
 
-        M = a.shape[0]
-        theta = np.zeros(M, dtype=np.float64)
-        phi = np.zeros(M, dtype=np.float64)
+        B = a.shape[0]
+        theta = torch.zeros(B, dtype=torch.float64)
+        phi = torch.zeros(B, dtype=torch.float64)
 
-        zero_a = np.isclose(a, 0.0)  # already zero → identity-like
-        general = ~zero_a & ~np.isclose(b, 0.0)
+        zero_a = torch.isclose(a, torch.tensor(0.0, dtype=a.dtype))  # already zero -> identity-like
+        general = ~zero_a & ~torch.isclose(b, torch.tensor(0.0, dtype=b.dtype))
 
-        theta[zero_a] = np.pi  # T(π,0) swaps and zeros correctly
+        theta[zero_a] = torch.pi  # T(π,0) swaps and zeros correctly
 
-        if np.any(general):
+        if torch.any(general):
             r = -b[general] / a[general]
-            theta[general] = 2 * np.arctan(np.abs(r))
-            phi[general] = (-np.angle(r)) % (2 * np.pi)
+            theta[general] = 2 * torch.arctan(torch.abs(r))
+            phi[general] = (-torch.angle(r)) % (2 * torch.pi)
 
-        return theta % (2 * np.pi), phi % (2 * np.pi)
+        return theta % (2 * torch.pi), phi % (2 * torch.pi)
 
     @staticmethod
     def _phases_null_left(row: int, col: int, W: nparray) -> tuple:
@@ -730,43 +709,42 @@ class Clements(Mesh):
             Row index such that W[row+1, col] is the element to annihilate.
         col : int
             Column index of the element to annihilate.
-        W : nparray[np.complex128], shape (N, N, M)
+        W : toech.Tensor, shape (B, N, N)
             Current working matrix batch.
 
         Returns
         -------
-        theta : nparray[np.float64], shape (M,)
+        theta : torch.Tensor, shape (B,)
             Internal phase angles in [0, 2π).
-        phi : nparray[np.float64], shape (M,)
+        phi : torch.Tensor, shape (B,)
             External phase angles in [0, 2π).
         """
 
-        a = W[row + 1, col, :]  # element to annihilate, shape (M,)
-        b = W[row, col, :]  # neighbouring row,       shape (M,)
+        a = W[:, row + 1, col]  # element to annihilate, shape (B,)
+        b = W[:, row, col]  # neighbouring row, shape (B,)
 
-        M = a.shape[0]
-        theta = np.zeros(M, dtype=np.float64)
-        phi = np.zeros(M, dtype=np.float64)
+        B = a.shape[0]
+        theta = torch.zeros(B, dtype=torch.float64)
+        phi = torch.zeros(B, dtype=torch.float64)
 
-        zero_a = np.isclose(a, 0.0)
-        general = ~zero_a & ~np.isclose(b, 0.0)
+        zero_a = torch.isclose(a, torch.tensor(0.0, dtype=a.dtype))
+        general = ~zero_a & ~torch.isclose(b, torch.tensor(0.0, dtype=b.dtype))
 
-        theta[zero_a] = np.pi
+        theta[zero_a] = torch.pi
 
-        if np.any(general):
+        if torch.any(general):
             r = b[general] / a[general]
-            theta[general] = 2 * np.arctan(np.abs(r))
-            phi[general] = (-np.angle(r)) % (2 * np.pi)
-
-        return theta % (2 * np.pi), phi % (2 * np.pi)
+            theta[general] = 2 * torch.arctan(torch.abs(r))
+            phi[general] = (-torch.angle(r)) % (2 * torch.pi)
+        return theta % (2 * torch.pi), phi % (2 * torch.pi)
 
     @staticmethod
     def _phi_left_to_right(
         m: int,
         n: int,
-        theta: nparray[np.float64],
-        W: nparray[np.complex128],
-    ) -> nparray[np.float64]:
+        theta: torch.Tensor,
+        W: torch.Tensor,
+    ) -> torch.Tensor:
         """
         Convert a left MZI op into an equivalent right MZI op.
 
@@ -790,27 +768,27 @@ class Clements(Mesh):
             Index of the first affected mode.
         n : int
             Index of the second affected mode (n = m+1).
-        theta : nparray[np.float64], shape (M,)
+        theta : torch.Tensor, shape (B,)
             Internal phase angles (unchanged from the original left op).
-        W : nparray[np.complex128], shape (N, N, M)
+        W : torch.Tensor, shape (B, N, N)
             Working matrix batch after undoing the left application.
 
         Returns
         -------
-        nparray[np.float64], shape (M,)
+        torch.Tensor, shape (B,)
             New external phase angles phi_new for the equivalent right op.
         """
 
-        M = W.shape[2]
-        phi_new = np.zeros(M, dtype=np.float64)
+        B = W.shape[0]
+        phi_new = torch.zeros(B, dtype=torch.float64)
 
-        w_mm = W[m, m, :]
-        w_mn = W[m, n, :]
+        w_mm = W[:, m, m]
+        w_mn = W[:, m, n]
 
-        general = ~np.isclose(np.abs(w_mn), 0.0)
-        if np.any(general):
+        general = ~torch.isclose(torch.abs(w_mn), torch.tensor(0.0, dtype=torch.abs(w_mn).dtype))
+        if torch.any(general):
             r = -w_mm[general] / w_mn[general]
-            phi_new[general] = (np.angle(r) + np.pi) % (2 * np.pi)
+            phi_new[general] = (torch.angle(r) + torch.pi) % (2 * torch.pi)
 
         return phi_new
 
@@ -870,9 +848,9 @@ class Clements(Mesh):
 
     def clements_decompose(
         self,
-        U: nparray[np.complex128],
+        U: torch.Tensor,
         tol: float = 1e-11,
-    ) -> tuple[nparray[np.complex128], list[MZIOp]]:
+    ) -> tuple[torch.Tensor, list[MZIOp]]:
         """
         Batched Clements decomposition of a unitary matrix batch.
 
@@ -903,14 +881,14 @@ class Clements(Mesh):
 
         Parameters
         ----------
-        U : nparray[np.complex128], shape (N, N, M)
-            Batch of unitary matrices to decompose.
+        U : torch.Tensor, shape (B, N, N)
+            Batch of B unitary N x N matrices to decompose.
         tol : float, optional
             Absolute tolerance for the unitarity check. Default is 1e-11.
 
         Returns
         -------
-        D : nparray[np.complex128], shape (N, N, M)
+        D : torch.Tensor, shape (B, N, N)
             Diagonal unitary batch.
         right_ops : list[MZIOp]
             All MZI ops in application order. Reconstruct with
@@ -922,16 +900,15 @@ class Clements(Mesh):
             If one or more matrices in the batch are not unitary.
         """
 
-        N, _, M = U.shape
+        B, _, N = U.shape
 
         # Unitarity check: U @ U^dag ~= I
-        UUd = self._bmm(U, np.conjugate(U).transpose(1, 0, 2))
-        I = np.zeros((N, N, M), dtype=np.complex128)
-        I[np.arange(N), np.arange(N), :] = 1.0
-        if not np.allclose(UUd, I, atol=tol, rtol=0):
+        UUd = torch.bmm(U, torch.adjoint(U))
+        I = torch.eye(N, dtype=torch.complex128).unsqueeze(0).repeat(B, 1, 1)
+        if not torch.allclose(UUd, I, atol=tol, rtol=0):
             raise ValueError("One or more matrices in the batch are not unitary.")
 
-        W: nparray[np.complex128] = U.copy()
+        W: torch.Tensor = U.clone().detach()
         right_ops: list[MZIOp] = []  # ops applied as  W <- W @ T^dag
         left_ops: list[MZIOp] = []  # ops applied as  W <- T   @ W
 
@@ -942,26 +919,26 @@ class Clements(Mesh):
                     row, col = i + j + 1, j
                     theta, phi = self._phases_null_right(row, col, W)
                     right_ops.append(MZIOp(m=col, n=col + 1, theta=theta, phi=phi))
-                    W = self._bmm(W, self.mzi_matrix_dag(col, col + 1, theta, phi, N))
+                    W = torch.bmm(W, self.mzi_matrix_dag(col, col + 1, theta, phi, N))
             else:
                 # LEFT ops: zero W[row+1, col] via  W <- T(row, row+1) @ W
                 for j in range(N - 1 - i):
                     row, col = i + j, j
                     theta, phi = self._phases_null_left(row, col, W)
                     left_ops.append(MZIOp(m=row, n=row + 1, theta=theta, phi=phi))
-                    W = self._bmm(self.mzi_matrix(row, row + 1, theta, phi, N), W)
+                    W = torch.bmm(self.mzi_matrix(row, row + 1, theta, phi, N), W)
 
         # W is diagonal
         # Convert each LEFT op into an equivalent RIGHT op (batch).
         for op in reversed(left_ops):
             # Undo the left application
-            W = self._bmm(self.mzi_matrix_dag(op.m, op.n, op.theta, op.phi, N), W)
+            W = torch.bmm(self.mzi_matrix_dag(op.m, op.n, op.theta, op.phi, N), W)
 
             # Compute phi_new (batch) that re-zeroes W[m, n] via a right op
             phi_new = self._phi_left_to_right(op.m, op.n, op.theta, W)
 
             # Apply the equivalent right op
-            W = self._bmm(W, self.mzi_matrix_dag(op.m, op.n, op.theta, phi_new, N))
+            W = torch.bmm(W, self.mzi_matrix_dag(op.m, op.n, op.theta, phi_new, N))
 
             right_ops.append(MZIOp(m=op.m, n=op.n, theta=op.theta, phi=phi_new))
 
@@ -1045,7 +1022,7 @@ class Bell(Mesh):
         V2 = sp.linalg.block_diag(V2, np.array([[1]]))
 
         # Array of matrices that describe the processor (mixing layers)
-        M = np.zeros((n_mixing_layers, self.n_modes, self.n_modes), dtype=complex)
+        M = np.zeros((n_mixing_layers, self.n_modes, self.n_modes), dtype=np.complex128)
 
         # Populate M
         for ii in range(1, n_mixing_layers, 2):
@@ -1093,7 +1070,7 @@ class Bell(Mesh):
 
         B = phases.shape[0]
         # (B, N, N) identity array
-        U = np.tile(np.eye(self.n_modes, dtype=complex), (B, 1, 1))
+        U = np.tile(np.eye(self.n_modes, dtype=np.complex128), (B, 1, 1))
 
         # Vectorized propagation
         for ii in range(self.n_mixing_layers - 1):
@@ -1160,7 +1137,7 @@ class Bell(Mesh):
         n_matrices = self.n_mixing_layers + 1  # Number of mixing matrices + the inverse of the target
 
         # Array of mixing matrices with inv_target at the end, over B batches
-        v_matrices = np.zeros((B, n_matrices, self.n_modes, self.n_modes), dtype=complex)
+        v_matrices = np.zeros((B, n_matrices, self.n_modes, self.n_modes), dtype=np.complex128)
         v_matrices[:, :-1] = self.M
         v_matrices[:, -1] = U_target.conj().transpose(0, 2, 1)
 
@@ -1174,7 +1151,7 @@ class Bell(Mesh):
         start_time = time.time()
 
         for step in range(max_iter):
-            buffer_matrix = np.tile(np.eye(self.n_modes, dtype=complex), (B, 1, 1))
+            buffer_matrix = np.tile(np.eye(self.n_modes, dtype=np.complex128), (B, 1, 1))
 
             # Calculates the matrix product
             for ii in range(n_matrices):
@@ -1250,7 +1227,7 @@ if __name__ == "__main__":
     from calippo.tools import fidelity, get_haar_unitary, make_real_border
 
     n = 6
-    batch_size = 1
+    batch_size = 10
     processor = Clements(n_modes=n)
 
     print(f"\n--- Batch Testing ({batch_size} unitaries simultaneously) ---")
@@ -1261,7 +1238,9 @@ if __name__ == "__main__":
 
     # 2. Decomposition and Parallel Current Calculation
     start_t = time.time()
+    u_target = torch.from_numpy(u_target)  # TODO: UPDATE TOOL TO USE PYTORCH
     phases_target = processor.phases_from_U(u_target, plot_graph=True)
+    print(f"{phases_target=}")
     currents_target = processor.currents_from_phases(phases_target)
     print(f"-> Decomposition and current calculation completed in {time.time()-start_t:.3f}s")
 
@@ -1273,10 +1252,11 @@ if __name__ == "__main__":
     u_exp, _, _ = make_real_border(u_exp_raw)
 
     # 5. Fidelity Calculation (tools.fidelity intrinsically supports batches!)
+    u_target = u_target.numpy()  # TODO: remove this here
+
     fids = fidelity(u_target, u_exp)
 
-    print("-" * 45)
-    print(f"Final Fidelities: {fids}")
+    print("-" * 45, f"\nFinal Fidelities: {fids}")
 
     if np.all(fids > 0.9999):
         print("Test PASSED: Batch decomposition and propagation are accurate.")
