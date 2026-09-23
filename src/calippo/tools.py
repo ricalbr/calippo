@@ -257,7 +257,8 @@ def get_haar_unitary(size: int, batch_size: int = 1) -> np.ndarray:
     # Apply phases: Q @ diag(phases)
     Q *= phases[:, np.newaxis, :]
 
-    return Q[0] if batch_size == 1 else Q
+    return Q
+    # return Q[0] if batch_size == 1 else Q
 
 
 # ==================================================================
