@@ -27,9 +27,9 @@ Bell
 from __future__ import annotations
 
 import dataclasses
-import itertools
 import pickle
 import time
+import itertools
 from abc import ABC, abstractmethod
 from typing import Optional
 
@@ -428,7 +428,7 @@ class Clements(Mesh):
         V1 = sp.linalg.block_diag(*layer_mat)
 
         # Second kind of beam-splitter layer (V2)
-        layer_mat = [np.eye(1)] + [BS] * (self.n_modes // 2 - 1) + [np.eye(1)]
+        layer_mat = [np.eye(1)] + [BS] * (self.n_modes // 2 -1) + [np.eye(1)]
         V2 = sp.linalg.block_diag(*layer_mat)
 
         # Array of matrices that describe the processor (mixing layers)
@@ -494,10 +494,10 @@ class Clements(Mesh):
 
         # Layer structure: (is_internal, size_v, indices)
         layer_specs = [
-            (False, size_v1, idx_v1),  # pattern 0: V1 ext
-            (True, size_v1, idx_v1),  # pattern 1: V1 int
-            (False, size_v2, idx_v2),  # pattern 2: V2 ext
-            (True, size_v2, idx_v2),  # pattern 3: V2 int
+            (False, size_v1, idx_v1),   # pattern 0: V1 ext
+            (True, size_v1, idx_v1),    # pattern 1: V1 int
+            (False, size_v2, idx_v2),   # pattern 2: V2 ext
+            (True, size_v2, idx_v2),    # pattern 3: V2 int
         ]
 
         def consume_phases(phase_tensor, ptr, size):
@@ -513,10 +513,10 @@ class Clements(Mesh):
 
             phase_multiplier = np.ones((B, self.n_modes), dtype=np.complex128)
             phase_multiplier[:, indices] = np.exp(1j * layer_phases)
-
+            
             # Broadcasting phase multiplier along rows: (B, N, 1)
             U *= phase_multiplier[:, :, None]
-
+            
             # Multiplication by the current mixing layer
             U = self.M[ii] @ U
 
@@ -533,16 +533,18 @@ class Clements(Mesh):
 
         th = torch.stack([t.theta for t in Tlist], dim=1)
         ph = torch.stack([t.phi for t in Tlist], dim=1)
-
         phases = torch.cat([th, ph], dim=1)
 
-        # Remapping
-        phases[:, 20] -= phases[:, 18]  # Phase 20 -> 20 - 18
-        phases[:, 21] -= phases[:, 19]  # Phase 21 -> 21 - 19
-        phases[:, 23] -= phases[:, 19]  # Phase 23 -> 23 - 19
-        phases[:, 25] -= phases[:, 19]  # Phase 25 -> 25 - 19
-        # phases[:, 15:20] = 0            # Redundant phases, remapped
+        # Remapping the redundant external phases (exluding the first n / 2, not involved in any MZI ring)
+        idx_start = self.n_phases // 2 + n // 2
+        idx_end = self.n_phases // 2 + (n - 1)
+        delta = int(idx_end - idx_start)
+        counter = 1
 
+        for ii in range(idx_start, idx_end):
+            for k in range(counter):
+                phases[:, ii + (k+1) * delta] -= phases[:, ii]
+            counter += 2
         return phases
 
     @staticmethod
@@ -1226,9 +1228,9 @@ if __name__ == "__main__":
 
     from calippo.tools import fidelity, get_haar_unitary, make_real_border
 
-    n = 6
-    batch_size = 10
-    processor = Clements(n_modes=n)
+    n = 24
+    batch_size = 1000
+    processor = Bell(n_modes=n)
 
     print(f"\n--- Batch Testing ({batch_size} unitaries simultaneously) ---")
 
@@ -1238,9 +1240,8 @@ if __name__ == "__main__":
 
     # 2. Decomposition and Parallel Current Calculation
     start_t = time.time()
-    u_target = torch.from_numpy(u_target)  # TODO: UPDATE TOOL TO USE PYTORCH
+    # u_target = torch.from_numpy(u_target)  # TODO: UPDATE TOOL TO USE PYTORCH
     phases_target = processor.phases_from_U(u_target, plot_graph=True)
-    print(f"{phases_target=}")
     currents_target = processor.currents_from_phases(phases_target)
     print(f"-> Decomposition and current calculation completed in {time.time()-start_t:.3f}s")
 
@@ -1252,8 +1253,8 @@ if __name__ == "__main__":
     u_exp, _, _ = make_real_border(u_exp_raw)
 
     # 5. Fidelity Calculation (tools.fidelity intrinsically supports batches!)
-    u_target = u_target.numpy()  # TODO: remove this here
-
+    # u_target = u_target.numpy() #TODO: remove this here
+    
     fids = fidelity(u_target, u_exp)
 
     print("-" * 45, f"\nFinal Fidelities: {fids}")
