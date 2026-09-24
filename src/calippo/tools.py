@@ -31,7 +31,9 @@ import torch
 from typing import Tuple, Optional
 
 
-def sinkhorn(U: torch.Tensor, tol: float = 1e-6, max_iter: int = 1000) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def sinkhorn(
+    U: torch.Tensor, tol: float = 1e-6, max_iter: int = 1000
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Normalize a (batch of) positive tensors using the Sinkhorn–Knopp algorithm.
 
@@ -69,7 +71,7 @@ def sinkhorn(U: torch.Tensor, tol: float = 1e-6, max_iter: int = 1000) -> Tuple[
 
     B, N, _ = U_work.shape
     device = U.device
-    
+
     D_in = torch.ones((B, N), dtype=torch.float64, device=device)
     D_out = torch.ones((B, N), dtype=torch.float64, device=device)
 
@@ -247,11 +249,13 @@ def get_haar_unitary(size: int, batch_size: int = 1, device: Optional[torch.devi
     """
     if device is None:
         device = torch.device("cpu")
-        
+
     # Generate random complex tensors: (B, N, N).
     # Using standard normal distribution for real and imaginary parts
-    X = (torch.randn(batch_size, size, size, dtype=torch.float64, device=device) + 
-         1j * torch.randn(batch_size, size, size, dtype=torch.float64, device=device)) / np.sqrt(2)
+    X = (
+        torch.randn(batch_size, size, size, dtype=torch.float64, device=device)
+        + 1j * torch.randn(batch_size, size, size, dtype=torch.float64, device=device)
+    ) / np.sqrt(2)
 
     # QR decomposition (vectorized over the first dimension)
     # torch.linalg.qr returns Q and R. Q is unitary.
@@ -293,7 +297,9 @@ if __name__ == "__main__":
 
         # 1. Test Unitarity: U^H @ U should be I
         U_H = torch.adjoint(U_test)
-        error_unitarity = torch.mean(torch.abs(torch.matmul(U_H, U_test) - torch.eye(size, dtype=U_test.dtype, device=U_test.device))).item()
+        error_unitarity = torch.mean(
+            torch.abs(torch.matmul(U_H, U_test) - torch.eye(size, dtype=U_test.dtype, device=U_test.device))
+        ).item()
         print(f"Mean Unitarity Error:      {error_unitarity:.2e}")
 
         # 2. Test Eigenvalue Distribution:
@@ -333,10 +339,13 @@ if __name__ == "__main__":
         # 2. Add noise
         # Maintain the dimensional symmetry of the noise based on the target.
         if U_target.ndim == 2:
-            noise = (torch.randn(size, size, dtype=torch.float64) + 1j * torch.randn(size, size, dtype=torch.float64)) * noise_intensity
+            noise = (
+                torch.randn(size, size, dtype=torch.float64) + 1j * torch.randn(size, size, dtype=torch.float64)
+            ) * noise_intensity
         else:
             noise = (
-                torch.randn(batch_size, size, size, dtype=torch.float64) + 1j * torch.randn(batch_size, size, size, dtype=torch.float64)
+                torch.randn(batch_size, size, size, dtype=torch.float64)
+                + 1j * torch.randn(batch_size, size, size, dtype=torch.float64)
             ) * noise_intensity
 
         U_noisy = U_target + noise.to(U_target.device)
