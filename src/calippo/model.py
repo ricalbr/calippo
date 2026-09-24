@@ -3,7 +3,7 @@
 """
 Created on Thu Jun 11 16:07:49 2026
 
-@author: Andrea Crespi, Francesco Ceccarelli
+@author: Andrea Crespi, Francesco Ceccarelli, Riccardo Albiero
 
 Digital twin models for Universal Photonic Processors (UPP).
 
@@ -27,9 +27,9 @@ Bell
 from __future__ import annotations
 
 import dataclasses
+import itertools
 import pickle
 import time
-import itertools
 from abc import ABC, abstractmethod
 from typing import Optional
 
@@ -38,12 +38,12 @@ import numpy as np
 import numpy.typing as npt
 import scipy as sp
 import torch
-import torch.types
+import torch.nn as nn
 
 nparray = npt.NDArray
 
 
-class Mesh(ABC):
+class Mesh(nn.Module, ABC):
     """
     Abstract base class for UPP meshes.
     It defines the common interface and internal structures that all mesh
@@ -59,29 +59,37 @@ class Mesh(ABC):
     """
 
     def __init__(self, n_modes: int, calibration_file: Optional[str] = None) -> None:
+        super().__init__()
 
         if n_modes % 2 != 0:
             n_modes -= 1
-            print("Modes must be EVEN for this version.")
-            print(f"We shall take {n_modes} modes.")
+            print("Modes must be EVEN for this version.\n", f"We shall take {n_modes} modes.")
 
         self.n_modes = n_modes  # Number of modes
         self.n_phases = (n_modes - 1) * n_modes  # Number of tunable parameters
         self.n_used_phases = (n_modes - 1) ** 2  # Number of in-use tunable parameters
 
         # This part builds the specific topology of the mesh (implemented by children)
-        self.static_phases_mask, self.xtalk_mask = (
-            self._generate_masks()
-        )  # Masks that relate the used calibration parameters to the available ones
-        self.n_mixing_layers, self.M = (
-            self._generate_mixing_layers()
-        )  # Mode mixing implemented by directional couplers layers
+        static_phases_mask_np, xtalk_mask_np = self._generate_masks()
+        n_mixing_layers, M_np = self._generate_mixing_layers()
+        self.n_mixing_layers = n_mixing_layers
+
+        # Register as PyTorch buffers for device compatibility (non-trainable)
+        # Masks that relate the used calibration parameters to the available ones
+        self.register_buffer("static_phases_mask", torch.from_numpy(static_phases_mask_np).bool())
+        self.register_buffer("xtalk_mask", torch.from_numpy(xtalk_mask_np).float())
+        # Mode mixing implemented by directional couplers layers
+        self.register_buffer("M", torch.from_numpy(M_np).to(torch.complex128))
 
         # This part populates xtalk (rad/mA2) and static phases (rad)
         if calibration_file is not None:
-            self.static_phases, self.xtalk = self.import_calibration(calibration_file)
+            sp_np, xt_np = self.import_calibration(calibration_file)
         else:
-            self.static_phases, self.xtalk = self.generate_random_calibration(1.0, 2 * np.pi)
+            sp_np, xt_np = self.generate_random_calibration(1.0, 2 * np.pi)
+
+        # Register as Parameters to enable training (e.g., with Adam)
+        self.static_phases = nn.Parameter(torch.from_numpy(sp_np).float())
+        self.xtalk = nn.Parameter(torch.from_numpy(xt_np).float())
 
         # Output
         msg = (
@@ -135,9 +143,9 @@ class Mesh(ABC):
 
         # Fetch dataset
         static_phases = np.mod(calibration["static_phases"], 2 * np.pi)
-        static_phases = static_phases * self.static_phases_mask
+        static_phases = static_phases * self.static_phases_mask.cpu().numpy()
         xtalk = calibration["xt_matrix"]
-        xtalk = xtalk * self.xtalk_mask
+        xtalk = xtalk * self.xtalk_mask.cpu().numpy()
 
         return static_phases, xtalk
 
@@ -169,15 +177,18 @@ class Mesh(ABC):
         if noise is None:
             noise = xtalk_ampl / 10.0
 
+        sp_mask_np = self.static_phases_mask.cpu().numpy()
+        xt_mask_np = self.xtalk_mask.cpu().numpy()
+
         # Build dataset
         static_phases = np.mod(np.random.rand(self.n_phases) * static_phases_ampl, 2 * np.pi)
-        static_phases = static_phases * self.static_phases_mask
+        static_phases = static_phases * sp_mask_np
         xtalk = np.eye(self.n_phases) * xtalk_ampl + (np.random.rand(self.n_phases, self.n_phases) - 0.5) * noise
-        xtalk = xtalk * self.xtalk_mask
+        xtalk = xtalk * xt_mask_np
 
         return static_phases, xtalk
 
-    def generate_random_currents(self, current_ampl: float, batch_size: Optional[int] = None) -> nparray:
+    def generate_random_currents(self, current_ampl: float, batch_size: Optional[int] = None) -> torch.Tensor:
         """
         Generate random currents in mA. Supports single vectors or batches.
 
@@ -190,34 +201,33 @@ class Mesh(ABC):
 
         Returns
         -------
-        np.ndarray
-            Array of randomized currents in mA.
+        torch.Tensor
+            Tensor of randomized currents in mA.
         """
         # Check dimension in order to provide always squeezed shape
         if batch_size is None:
-            I = np.sqrt(np.random.rand(self.n_phases)) * current_ampl
+            I = torch.sqrt(torch.rand(self.n_phases)) * current_ampl
         else:
-            I = np.sqrt(np.random.rand(batch_size, self.n_phases)) * current_ampl
+            I = torch.sqrt(torch.rand(batch_size, self.n_phases)) * current_ampl
 
         # Return only useful currents
-        I *= self.static_phases_mask
-
+        I *= self.static_phases_mask.cpu().float()
         return I
 
-    def phases_from_currents(self, currents: nparray) -> nparray:
+    def phases_from_currents(self, currents: torch.Tensor) -> torch.Tensor:
         """
         Calculate the optical phases for currents based on the cross-talk
         coefficients. Supports batches (B, n_phases) or single (n_phases,).
 
         Parameters
         ----------
-        currents : np.ndarray
-            Array of currents in mA.
+        currents : torch.Tensor
+            Tensor of currents in mA.
 
         Returns
         -------
-        np.ndarray
-            Array of calculated phases in rad.
+        torch.Tensor
+            Tensor of calculated phases in rad.
 
         Raises
         ------
@@ -228,25 +238,31 @@ class Mesh(ABC):
         # Check dimension to guarantee vectorial shape
         is_1d = currents.ndim == 1
         if is_1d:
-            currents = currents[np.newaxis, :]
+            currents = currents.unsqueeze(0)
 
         # Input validation
         if currents.shape[-1] != self.n_phases:
-            raise ValueError(
-                f"Dimension mismatch: expected last dimension to be {self.n_phases}, found {currents.shape[-1]}."
-            )
+            raise ValueError(f"Dimension mismatch: expected last dimension to be {self.n_phases}, found {currents.shape[-1]}.")
 
-        # Calculate phases: (B, P) @ (P, P).T -> (B, P)
-        phases = self.static_phases + (currents**2) @ self.xtalk.T
-        phases = np.mod(phases, 2 * np.pi)
+        # Dynamically cast internal parameters to match the input currents dtype
+        static_phases = self.static_phases.to(currents.dtype)
+        xtalk = self.xtalk.to(currents.dtype)
 
-        return phases[0] if is_1d else phases
+        # Calculate phases (Gradient support): (B, P) @ (P, P).T -> (B, P)
+        # Now both are guaranteed to be the same precision
+        phases = static_phases + (currents**2) @ xtalk.T
+        
+        # Keep 2*pi in the same dtype to prevent unexpected promotion
+        pi_tensor = torch.tensor(2 * torch.pi, dtype=currents.dtype, device=currents.device)
+        phases = phases % pi_tensor
 
+        return phases.squeeze(0) if is_1d else phases
+    
     @abstractmethod
-    def U_from_phases(self, phases: nparray) -> nparray:
+    def U_from_phases(self, phases: torch.Tensor) -> torch.Tensor:
         pass
 
-    def currents_from_phases(self, phases: nparray) -> nparray:
+    def currents_from_phases(self, phases: torch.Tensor) -> torch.Tensor:
         """
         Calculate the currents in mA required to achieve target optical phases,
         compensating for cross-talk using the calibration matrix.
@@ -254,13 +270,13 @@ class Mesh(ABC):
 
         Parameters
         ----------
-        phases : np.ndarray
-            Array of target phase values in rad. Shape (n_phases,) or (B, n_phases).
+        phases : torch.Tensor
+            Tensor of target phase values in rad. Shape (n_phases,) or (B, n_phases).
 
         Returns
         -------
-        np.ndarray
-            Array of currents in mA. Shape (n_phases,) or (B, n_phases).
+        torch.Tensor
+            Tensor of currents in mA. Shape (n_phases,) or (B, n_phases).
 
         Raises
         ------
@@ -268,52 +284,57 @@ class Mesh(ABC):
             If the last dimension of the input array does not match the
             expected number of phases for the mesh.
         """
-
-        # TODO: maybe remove this
-        if isinstance(phases, torch.Tensor):
-            phases = phases.numpy()
-
         # Check dimension to guarantee vectorial shape
         is_1d = phases.ndim == 1
         if is_1d:
-            phases = phases[np.newaxis, :]
+            phases = phases.unsqueeze(0)
 
         # Input validation
         if phases.shape[-1] != self.n_phases:
-            raise ValueError(
-                f"Dimension mismatch: expected last dimension to be {self.n_phases}, found {phases.shape[-1]}."
-            )
-        phases = np.mod(phases, 2 * np.pi)
+            raise ValueError(f"Dimension mismatch: expected last dimension to be {self.n_phases}, found {phases.shape[-1]}.")
+        
+        phases = phases % (2 * torch.pi)
 
         # Reduce dimensions to used parameters in order to avoid singularities
         phases_used = phases[:, self.static_phases_mask]
-        static_phases = self.static_phases[self.static_phases_mask]
-        used_rows = np.any(self.xtalk_mask, axis=0)
-        xtalk = self.xtalk[np.ix_(used_rows, used_rows)]
+        
+        # Cast static_phases to match the dtype of the input phases
+        static_phases = self.static_phases[self.static_phases_mask].to(phases.dtype)
+        
+        used_rows = torch.any(self.xtalk_mask, dim=0)
+        
+        # Cast xtalk to match the dtype of the input phases
+        xtalk = self.xtalk[used_rows][:, used_rows].to(phases.dtype)
 
         # Numerical inversion.
         # The equation is: xtalk @ I2^T = (phases_used - static_phases)^T
         # We transpose to align the batch axis (B) as the last dimension
         target_diff = (phases_used - static_phases).T
-        I2 = np.linalg.solve(xtalk, target_diff)
-        while np.any(I2 < 0):
-            target_diff[I2 < 0] += 2 * np.pi
-            I2 = np.linalg.solve(xtalk, target_diff)
+        I2 = torch.linalg.solve(xtalk, target_diff)
+        
+        # Keep 2*pi in the same dtype
+        pi_tensor = torch.tensor(2 * torch.pi, dtype=phases.dtype, device=phases.device)
+        
+        while torch.any(I2 < 0):
+            target_diff[I2 < 0] += pi_tensor
+            I2 = torch.linalg.solve(xtalk, target_diff)
 
         # Transpose back and reconstruct original dimensions
         I2 = I2.T
-        I = np.zeros_like(phases, dtype=float)
-        I[:, self.static_phases_mask] = np.sqrt(I2)
+        
+        # Inherit the dtype directly from phases
+        I = torch.zeros_like(phases)
+        I[:, self.static_phases_mask] = torch.sqrt(I2)
 
-        return I[0] if is_1d else I
-
+        return I.squeeze(0) if is_1d else I
+    
     @abstractmethod
     def phases_from_U(
         self,
-        U_target: nparray,
+        U_target: torch.Tensor,
         target_infidelity: float = 1e-6,
         **kwargs,
-    ) -> nparray:
+    ) -> torch.Tensor:
         pass
 
 
@@ -328,7 +349,6 @@ class MZIOp:
     theta : internal (splitting) phase, shape (B,)
     phi   : external phase, shape (B,)
     """
-
     m: int
     n: int
     theta: torch.Tensor
@@ -353,7 +373,6 @@ class Clements(Mesh):
         tuple of np.ndarray
             A tuple containing (static_phases_mask, xtalk_mask).
         """
-
         # Generate static_phases_mask
         static_phases_mask = np.ones(self.n_phases, dtype=int)
         half_idx = self.n_phases // 2
@@ -421,14 +440,14 @@ class Clements(Mesh):
         n_mixing_layers = 2 * self.n_modes  # Number of mixing layers (EXCLUDING the phase blocks)
         refl = 0.5
         trasm = 1.0 - refl
-        BS = np.array([[np.sqrt(trasm), 1j * np.sqrt(refl)], [1j * np.sqrt(refl), np.sqrt(trasm)]])
+        BS = torch.tensor([[np.sqrt(trasm), 1j * np.sqrt(refl)], [1j * np.sqrt(refl), np.sqrt(trasm)]])
 
         # First kind of beam-splitter layer (V1)
         layer_mat = [BS] * (self.n_modes // 2)
         V1 = sp.linalg.block_diag(*layer_mat)
 
         # Second kind of beam-splitter layer (V2)
-        layer_mat = [np.eye(1)] + [BS] * (self.n_modes // 2 -1) + [np.eye(1)]
+        layer_mat = [np.eye(1)] + [BS] * (self.n_modes // 2 - 1) + [np.eye(1)]
         V2 = sp.linalg.block_diag(*layer_mat)
 
         # Array of matrices that describe the processor (mixing layers)
@@ -441,7 +460,7 @@ class Clements(Mesh):
 
         return n_mixing_layers, M
 
-    def U_from_phases(self, phases: nparray) -> nparray:
+    def U_from_phases(self, phases: torch.Tensor) -> torch.Tensor:
         """
         Calculate the 2D unitary matrix representation of the processor on the
         basis of the provided phase array.
@@ -453,12 +472,12 @@ class Clements(Mesh):
 
         Parameters
         ----------
-        phases : np.ndarray
-            Array of optical phases in rad. Shape (n_phases,) or (B, n_phases).
+        phases : torch.Tensor
+            Tensor of optical phases in rad. Shape (n_phases,) or (B, n_phases).
 
         Returns
         -------
-        np.ndarray
+        torch.Tensor
             The complex unitary matrix resulting from the propagation.
             Shape (n_modes, n_modes) or (B, n_modes, n_modes).
 
@@ -471,15 +490,17 @@ class Clements(Mesh):
         # Check dimension to guarantee vectorial shape
         is_1d = phases.ndim == 1
         if is_1d:
-            phases = phases[np.newaxis, :]
+            phases = phases.unsqueeze(0)
 
         # Input validation
         if phases.shape[-1] != self.n_phases:
             raise ValueError(f"Dimension mismatch: expected {self.n_phases} elements, found {phases.shape[-1]}.")
 
         B = phases.shape[0]
+        device = phases.device
+        
         # (B, N, N) identity array
-        U = np.tile(np.eye(self.n_modes, dtype=np.complex128), (B, 1, 1))
+        U = torch.eye(self.n_modes, dtype=torch.complex128, device=device).unsqueeze(0).repeat(B, 1, 1)
 
         # Pointers for internal and external phases
         int_ptr = 0
@@ -489,15 +510,15 @@ class Clements(Mesh):
         size_v1 = self.n_modes // 2
         size_v2 = self.n_modes // 2 - 1
 
-        idx_v1 = np.arange(0, self.n_modes, 2)
-        idx_v2 = np.arange(1, self.n_modes - 1, 2)
+        idx_v1 = torch.arange(0, self.n_modes, 2, device=device)
+        idx_v2 = torch.arange(1, self.n_modes - 1, 2, device=device)
 
         # Layer structure: (is_internal, size_v, indices)
         layer_specs = [
-            (False, size_v1, idx_v1),   # pattern 0: V1 ext
-            (True, size_v1, idx_v1),    # pattern 1: V1 int
-            (False, size_v2, idx_v2),   # pattern 2: V2 ext
-            (True, size_v2, idx_v2),    # pattern 3: V2 int
+            (False, size_v1, idx_v1),  # pattern 0: V1 ext
+            (True, size_v1, idx_v1),   # pattern 1: V1 int
+            (False, size_v2, idx_v2),  # pattern 2: V2 ext
+            (True, size_v2, idx_v2),   # pattern 3: V2 int
         ]
 
         def consume_phases(phase_tensor, ptr, size):
@@ -511,24 +532,33 @@ class Clements(Mesh):
             else:
                 layer_phases, ext_ptr = consume_phases(phases, ext_ptr, size_v)
 
-            phase_multiplier = np.ones((B, self.n_modes), dtype=np.complex128)
-            phase_multiplier[:, indices] = np.exp(1j * layer_phases)
-            
+            phase_multiplier = torch.ones((B, self.n_modes), dtype=torch.complex128, device=device)
+            phase_multiplier[:, indices] = torch.exp(1j * layer_phases.to(torch.complex128))
+
             # Broadcasting phase multiplier along rows: (B, N, 1)
-            U *= phase_multiplier[:, :, None]
-            
+            U = U * phase_multiplier.unsqueeze(2)
+
             # Multiplication by the current mixing layer
-            U = self.M[ii] @ U
+            U = torch.matmul(self.M[ii], U)
 
-        return U[0] if is_1d else U
+        return U.squeeze(0) if is_1d else U
 
-    def phases_from_U(
-        self,
-        U_target: torch.Tensor,
-        target_infidelity: float = 1e-6,
-        **kwargs,
-    ) -> nparray:
+    def phases_from_U(self, U_target: torch.Tensor, target_infidelity: float = 1e-6, **kwargs) -> torch.Tensor:
+        """
+        Decomposes a target unitary matrix into the phases of the Clements mesh.
 
+        Parameters
+        ----------
+        U_target : torch.Tensor
+            Target unitary matrix. Shape (n_modes, n_modes) or (B, n_modes, n_modes).
+        target_infidelity : float, optional
+            Target infidelity threshold. Default is 1e-6.
+
+        Returns
+        -------
+        torch.Tensor
+            Tensor of phases matching the mesh configuration.
+        """
         _, Tlist = self.clements_decompose(U=U_target, tol=target_infidelity)
 
         th = torch.stack([t.theta for t in Tlist], dim=1)
@@ -545,7 +575,7 @@ class Clements(Mesh):
             for k in range(counter):
                 phases[:, ii + (k+1) * delta] -= phases[:, ii]
             counter += 2
-        return phases
+        return phases   
 
     @staticmethod
     def mzi_matrix(
@@ -586,9 +616,8 @@ class Clements(Mesh):
         torch.Tensor, shape (B, N, N)
             Batch of MZI unitary matrices.
         """
-
         B = theta.shape[0]
-        T = torch.eye(N, dtype=torch.complex128).unsqueeze(0).repeat(B, 1, 1)  # identity baseline
+        T = torch.eye(N, dtype=torch.complex128, device=theta.device).unsqueeze(0).repeat(B, 1, 1)
 
         j = torch.tensor(1j, device=theta.device)
         g = j * torch.exp(j * theta / 2)
@@ -634,7 +663,7 @@ class Clements(Mesh):
         return torch.adjoint(Clements.mzi_matrix(m, n, theta, phi, N))
 
     @staticmethod
-    def _phases_null_right(row: int, col: int, W: nparray) -> tuple:
+    def _phases_null_right(row: int, col: int, W: torch.Tensor) -> tuple:
         """
         Solve for (theta, phi) such that (W @ T^†)[row, col] = 0.
 
@@ -667,16 +696,15 @@ class Clements(Mesh):
         phi : torch.Tensor, shape (B,)
             External phase angles in [0, 2π).
         """
-
         a = W[:, row, col]  # element to annihilate, shape (B,)
         b = W[:, row, col + 1]  # neighbouring column, shape (B,)
-
         B = a.shape[0]
-        theta = torch.zeros(B, dtype=torch.float64)
-        phi = torch.zeros(B, dtype=torch.float64)
+        
+        theta = torch.zeros(B, dtype=torch.float64, device=W.device)
+        phi = torch.zeros(B, dtype=torch.float64, device=W.device)
 
-        zero_a = torch.isclose(a, torch.tensor(0.0, dtype=a.dtype))  # already zero -> identity-like
-        general = ~zero_a & ~torch.isclose(b, torch.tensor(0.0, dtype=b.dtype))
+        zero_a = torch.isclose(a, torch.tensor(0.0, dtype=a.dtype, device=W.device))  # already zero
+        general = ~zero_a & ~torch.isclose(b, torch.tensor(0.0, dtype=b.dtype, device=W.device))
 
         theta[zero_a] = torch.pi  # T(π,0) swaps and zeros correctly
 
@@ -688,7 +716,7 @@ class Clements(Mesh):
         return theta % (2 * torch.pi), phi % (2 * torch.pi)
 
     @staticmethod
-    def _phases_null_left(row: int, col: int, W: nparray) -> tuple:
+    def _phases_null_left(row: int, col: int, W: torch.Tensor) -> tuple:
         """
         Solve for (theta, phi) such that (T @ W)[row+1, col] = 0.
 
@@ -711,7 +739,7 @@ class Clements(Mesh):
             Row index such that W[row+1, col] is the element to annihilate.
         col : int
             Column index of the element to annihilate.
-        W : toech.Tensor, shape (B, N, N)
+        W : torch.Tensor, shape (B, N, N)
             Current working matrix batch.
 
         Returns
@@ -721,16 +749,15 @@ class Clements(Mesh):
         phi : torch.Tensor, shape (B,)
             External phase angles in [0, 2π).
         """
-
         a = W[:, row + 1, col]  # element to annihilate, shape (B,)
         b = W[:, row, col]  # neighbouring row, shape (B,)
-
         B = a.shape[0]
-        theta = torch.zeros(B, dtype=torch.float64)
-        phi = torch.zeros(B, dtype=torch.float64)
+        
+        theta = torch.zeros(B, dtype=torch.float64, device=W.device)
+        phi = torch.zeros(B, dtype=torch.float64, device=W.device)
 
-        zero_a = torch.isclose(a, torch.tensor(0.0, dtype=a.dtype))
-        general = ~zero_a & ~torch.isclose(b, torch.tensor(0.0, dtype=b.dtype))
+        zero_a = torch.isclose(a, torch.tensor(0.0, dtype=a.dtype, device=W.device))
+        general = ~zero_a & ~torch.isclose(b, torch.tensor(0.0, dtype=b.dtype, device=W.device))
 
         theta[zero_a] = torch.pi
 
@@ -738,6 +765,7 @@ class Clements(Mesh):
             r = b[general] / a[general]
             theta[general] = 2 * torch.arctan(torch.abs(r))
             phi[general] = (-torch.angle(r)) % (2 * torch.pi)
+            
         return theta % (2 * torch.pi), phi % (2 * torch.pi)
 
     @staticmethod
@@ -780,14 +808,12 @@ class Clements(Mesh):
         torch.Tensor, shape (B,)
             New external phase angles phi_new for the equivalent right op.
         """
-
         B = W.shape[0]
-        phi_new = torch.zeros(B, dtype=torch.float64)
-
+        phi_new = torch.zeros(B, dtype=torch.float64, device=W.device)
         w_mm = W[:, m, m]
         w_mn = W[:, m, n]
 
-        general = ~torch.isclose(torch.abs(w_mn), torch.tensor(0.0, dtype=torch.abs(w_mn).dtype))
+        general = ~torch.isclose(torch.abs(w_mn), torch.tensor(0.0, dtype=torch.abs(w_mn).dtype, device=W.device))
         if torch.any(general):
             r = -w_mm[general] / w_mn[general]
             phi_new[general] = (torch.angle(r) + torch.pi) % (2 * torch.pi)
@@ -827,14 +853,12 @@ class Clements(Mesh):
         list[MZIOp]
             MZI ops in column-major (physical mesh) order.
         """
-
         if not ops:
             return ops
-
+        
         # Greedy layer assignment: place each op in the first column where
         # neither of its two modes is already occupied.
         layers: list[list[int]] = []  # layers[col] = list of op indices
-
         for i, op in enumerate(ops):
             placed = False
             for layer in layers:
@@ -845,7 +869,6 @@ class Clements(Mesh):
                     break
             if not placed:
                 layers.append([i])
-
         return [ops[i] for layer in layers for i in layer]
 
     def clements_decompose(
@@ -901,18 +924,18 @@ class Clements(Mesh):
         ValueError
             If one or more matrices in the batch are not unitary.
         """
-
         B, _, N = U.shape
-
+        
         # Unitarity check: U @ U^dag ~= I
         UUd = torch.bmm(U, torch.adjoint(U))
-        I = torch.eye(N, dtype=torch.complex128).unsqueeze(0).repeat(B, 1, 1)
+        I = torch.eye(N, dtype=torch.complex128, device=U.device).unsqueeze(0).repeat(B, 1, 1)
+        
         if not torch.allclose(UUd, I, atol=tol, rtol=0):
             raise ValueError("One or more matrices in the batch are not unitary.")
 
         W: torch.Tensor = U.clone().detach()
         right_ops: list[MZIOp] = []  # ops applied as  W <- W @ T^dag
-        left_ops: list[MZIOp] = []  # ops applied as  W <- T   @ W
+        left_ops: list[MZIOp] = []   # ops applied as  W <- T  @ W
 
         for k, i in enumerate(range(N - 2, -1, -1)):
             if k % 2 == 0:
@@ -935,13 +958,11 @@ class Clements(Mesh):
         for op in reversed(left_ops):
             # Undo the left application
             W = torch.bmm(self.mzi_matrix_dag(op.m, op.n, op.theta, op.phi, N), W)
-
             # Compute phi_new (batch) that re-zeroes W[m, n] via a right op
             phi_new = self._phi_left_to_right(op.m, op.n, op.theta, W)
-
             # Apply the equivalent right op
             W = torch.bmm(W, self.mzi_matrix_dag(op.m, op.n, op.theta, phi_new, N))
-
+            
             right_ops.append(MZIOp(m=op.m, n=op.n, theta=op.theta, phi=phi_new))
 
         # W is diagonal; right_ops contains all transformations.
@@ -1035,7 +1056,7 @@ class Bell(Mesh):
 
         return n_mixing_layers, M
 
-    def U_from_phases(self, phases: nparray) -> nparray:
+    def U_from_phases(self, phases: torch.Tensor) -> torch.Tensor:
         """
         Calculate the 2D unitary matrix representation of the processor on the
         basis of the provided phase array.
@@ -1046,12 +1067,12 @@ class Bell(Mesh):
 
         Parameters
         ----------
-        phases : np.ndarray
-            Array of optical phases in rad. Shape (n_phases,) or (B, n_phases).
+        phases : torch.Tensor
+            Tensor of optical phases in rad. Shape (n_phases,) or (B, n_phases).
 
         Returns
         -------
-        np.ndarray
+        torch.Tensor
             The complex unitary matrix resulting from the propagation.
             Shape (n_modes, n_modes) or (B, n_modes, n_modes).
 
@@ -1064,20 +1085,22 @@ class Bell(Mesh):
         # Check dimension to guarantee vectorial shape
         is_1d = phases.ndim == 1
         if is_1d:
-            phases = phases[np.newaxis, :]
+            phases = phases.unsqueeze(0)
 
         # Input validation
         if phases.shape[-1] != self.n_phases:
             raise ValueError(f"Dimension mismatch: expected {self.n_phases} elements, found {phases.shape[-1]}.")
 
         B = phases.shape[0]
+        device = phases.device
+        
         # (B, N, N) identity array
-        U = np.tile(np.eye(self.n_modes, dtype=np.complex128), (B, 1, 1))
+        U = torch.eye(self.n_modes, dtype=torch.complex128, device=device).unsqueeze(0).repeat(B, 1, 1)
 
         # Vectorized propagation
         for ii in range(self.n_mixing_layers - 1):
             # Multiplication by the current mixing layer
-            U = self.M[ii] @ U
+            U = torch.matmul(self.M[ii], U)
 
             # Extract phases for the current layer
             # Each layer has exactly (n_modes - 1) phases
@@ -1086,24 +1109,27 @@ class Bell(Mesh):
             layer_phases = phases[:, start_idx:end_idx]
 
             # Broadcasting: add a column axis to correctly multiply rows
-            phase_multiplier = np.exp(1j * layer_phases)[:, :, np.newaxis]
-
-            # Apply the phase shift only to the first (n_modes - 1) rows
-            U[:, 0 : (self.n_modes - 1), :] *= phase_multiplier
+            phase_multiplier = torch.exp(1j * layer_phases.to(torch.complex128)).unsqueeze(2)
+            
+            # PYTORCH TRICK: Avoid in-place operations for Autograd compatibility
+            # Split and concatenate tensors instead of U[:, 0:N-1, :] = ...
+            U_top = U[:, 0 : (self.n_modes - 1), :] * phase_multiplier
+            U_bottom = U[:, (self.n_modes - 1):, :]
+            U = torch.cat([U_top, U_bottom], dim=1)
 
         # Last layer
-        U = self.M[-1] @ U
-
-        return U[0] if is_1d else U
-
+        U = torch.matmul(self.M[-1], U)
+        
+        return U.squeeze(0) if is_1d else U
+    
     def phases_from_U(
         self,
-        U_target: nparray,
+        U_target: torch.Tensor,
         max_iter: int = 100000,
         target_infidelity: float = 1e-6,
         plot_graph: bool = False,
         **kwargs,
-    ) -> nparray:
+    ) -> torch.Tensor:
         """
         Given a unitary matrix U_target, finds the phases that implement it
         with the UPP.
@@ -1115,7 +1141,7 @@ class Bell(Mesh):
 
         Parameters
         ----------
-        U_target : np.ndarray
+        U_target : torch.Tensor
             Target unitary matrix. Shape (n_modes, n_modes) or (B, n_modes, n_modes).
         max_iter : int, optional
             Maximum number of iterations.
@@ -1126,85 +1152,91 @@ class Bell(Mesh):
 
         Returns
         -------
-        np.ndarray
-            The array of optimal phases in rad. Shape (n_phases,) or (B, n_phases).
+        torch.Tensor
+            The tensor of optimal phases in rad. Shape (n_phases,) or (B, n_phases).
         """
         # Check dimension to guarantee vectorial shape
         is_2d = U_target.ndim == 2
         if is_2d:
-            U_target = U_target[np.newaxis, ...]
+            U_target = U_target.unsqueeze(0)
 
         # Useful definitions
         B = U_target.shape[0]
         n_matrices = self.n_mixing_layers + 1  # Number of mixing matrices + the inverse of the target
+        device = U_target.device
 
         # Array of mixing matrices with inv_target at the end, over B batches
-        v_matrices = np.zeros((B, n_matrices, self.n_modes, self.n_modes), dtype=np.complex128)
-        v_matrices[:, :-1] = self.M
-        v_matrices[:, -1] = U_target.conj().transpose(0, 2, 1)
+        v_matrices = torch.zeros((B, n_matrices, self.n_modes, self.n_modes), dtype=torch.complex128, device=device)
+        v_matrices[:, :-1] = self.M.unsqueeze(0)
+        v_matrices[:, -1] = torch.adjoint(U_target)
 
         # Phase terms are introduced before each V matrix in this
         # decomposition; they are here initialized to random values
-        phase_terms = np.exp(1j * np.random.rand(B, self.n_modes + 2, self.n_modes) * 2 * np.pi)
+        rand_angles = torch.rand(B, self.n_modes + 2, self.n_modes, dtype=torch.float64, device=device) * 2 * torch.pi
+        phase_terms = torch.exp(1j * rand_angles)
 
         # Start the iterative decomposition
         print(f"Iterative phases optimization (Batch size: {B})")
-        fidelity_monitor = np.zeros((B, max_iter))
+        fidelity_monitor = torch.zeros((B, max_iter), device=device)
+        
+        import time
         start_time = time.time()
 
         for step in range(max_iter):
-            buffer_matrix = np.tile(np.eye(self.n_modes, dtype=np.complex128), (B, 1, 1))
+            buffer_matrix = torch.eye(self.n_modes, dtype=torch.complex128, device=device).unsqueeze(0).repeat(B, 1, 1)
 
             # Calculates the matrix product
             for ii in range(n_matrices):
-                buffer_matrix = buffer_matrix * phase_terms[:, ii, :][:, :, np.newaxis]  # First phases (multiply rows)
-                buffer_matrix = v_matrices[:, ii, :, :] @ buffer_matrix  # Then mixing matrix
+                # Multiply rows (First phases)
+                buffer_matrix = buffer_matrix * phase_terms[:, ii, :].unsqueeze(2)
+                # Then mixing matrix
+                buffer_matrix = torch.matmul(v_matrices[:, ii, :, :], buffer_matrix)
 
-            # Vectorized fidelity check (Trace over inner axes)
-            trace_b = np.trace(buffer_matrix, axis1=1, axis2=2)
-            fid = np.abs(trace_b / self.n_modes) ** 2
+            # Vectorized fidelity check (Batch trace over inner axes)
+            trace_b = torch.einsum('bii->b', buffer_matrix)
+            fid = torch.abs(trace_b / self.n_modes) ** 2
             fidelity_monitor[:, step] = fid
 
             # If it is high enough it stops cycling
-            if np.all((1 - fid) < target_infidelity):
+            if torch.all((1 - fid) < target_infidelity):
                 fidelity_monitor = fidelity_monitor[:, :step]
                 break
 
             if step > 0 and step % 1000 == 0:
-                print(f"Iteration {step} - Max Infidelity: {np.max(1 - fid):.2e}")
+                print(f"Iteration {step} - Max Infidelity: {torch.max(1 - fid).item():.2e}")
 
             # If not, it performs another update cycle of all matrices
             for ii in range(n_matrices):
                 # Multiplication along columns to expose phases
-                buffer_matrix = buffer_matrix * phase_terms[:, ii, :].conj()[:, np.newaxis, :]
+                buffer_matrix = buffer_matrix * torch.conj(phase_terms[:, ii, :]).unsqueeze(1)
 
                 # Update phase list
-                diagonal = np.diagonal(buffer_matrix, axis1=1, axis2=2).conj()
-                phase_terms[:, ii, :] = diagonal / np.abs(diagonal)
+                diagonal = torch.diagonal(buffer_matrix, dim1=1, dim2=2).conj()
+                phase_terms[:, ii, :] = diagonal / torch.abs(diagonal)
 
                 # Multiplication along rows to apply new phases
-                buffer_matrix = buffer_matrix * phase_terms[:, ii, :][:, :, np.newaxis]
+                buffer_matrix = buffer_matrix * phase_terms[:, ii, :].unsqueeze(2)
 
                 # Removes next mixing layer
-                buffer_matrix = (
-                    v_matrices[:, ii, :, :] @ buffer_matrix @ v_matrices[:, ii, :, :].conj().transpose(0, 2, 1)
-                )
+                buffer_matrix = torch.matmul(v_matrices[:, ii, :, :], buffer_matrix)
+                buffer_matrix = torch.matmul(buffer_matrix, torch.adjoint(v_matrices[:, ii, :, :]))
 
         print(f"--- Elapsed time: {(time.time() - start_time):.2f} seconds.")
 
         # Vectorized cleanup and restoration
-        phase_terms = np.angle(phase_terms)  # Phases are now real numbers
-        phase_terms = phase_terms - phase_terms[:, :, -1][:, :, np.newaxis]  # Subtract the phase of the last mode
+        phase_terms = torch.angle(phase_terms)  # Phases are now real numbers
+        phase_terms = phase_terms - phase_terms[:, :, -1].unsqueeze(2)  # Subtract the phase of the last mode
         phase_terms = phase_terms[:, 1:-1, :]  # Remove external phases
+        
         phase_terms[:, 0, ::2] -= phase_terms[:, 0, 1::2]  # First layer only even modes
         phase_terms[:, 0, 1::2] = 0.0
-        phase_terms[:, -1, 1 : self.n_modes - 1 : 2] -= phase_terms[
-            :, -1, 2 : self.n_modes - 1 : 2
-        ]  # Last layer only odd modes
+        
+        phase_terms[:, -1, 1 : self.n_modes - 1 : 2] -= phase_terms[:, -1, 2 : self.n_modes - 1 : 2]  # Last layer only odd modes
         phase_terms[:, -1, : self.n_modes - 1 : 2] = 0.0
+        
         phase_terms = phase_terms[:, :, :-1]  # Removes last mode
         phases = phase_terms.reshape(B, -1)
-        phases = np.mod(phases, 2 * np.pi)
+        phases = phases % (2 * torch.pi)
 
         # Check dimension in order to provide always squeezed shape
         if is_2d:
@@ -1214,7 +1246,7 @@ class Bell(Mesh):
         # Output for debug
         if plot_graph:
             fig, ax = plt.subplots()
-            ax.semilogy((1 - fidelity_monitor).T)
+            ax.semilogy((1 - fidelity_monitor.cpu().numpy()).T)
             ax.set_xlabel("Iteration number")
             ax.set_ylabel("Infidelity")
             ax.set_title("Decomposition convergence diagram")
@@ -1223,44 +1255,56 @@ class Bell(Mesh):
 
         return phases
 
-
 if __name__ == "__main__":
 
-    from calippo.tools import fidelity, get_haar_unitary, make_real_border
+    from tools import fidelity, get_haar_unitary, make_real_border
+    import traceback
 
-    n = 24
-    batch_size = 1000
-    processor = Bell(n_modes=n)
+    processor = None
 
-    print(f"\n--- Batch Testing ({batch_size} unitaries simultaneously) ---")
+    try:
+        n = 24
+        batch_size = 1000
+        processor = Clements(n_modes=n)
 
-    # 1. Target: Generate a batch of Haar random unitaries (and make them "real-bordered")
-    u_target_raw = get_haar_unitary(n, batch_size)
-    u_target, _, _ = make_real_border(u_target_raw)
+        print(f"\n--- Batch Testing ({batch_size} unitaries simultaneously) ---")
 
-    # 2. Decomposition and Parallel Current Calculation
-    start_t = time.time()
-    # u_target = torch.from_numpy(u_target)  # TODO: UPDATE TOOL TO USE PYTORCH
-    phases_target = processor.phases_from_U(u_target, plot_graph=True)
-    currents_target = processor.currents_from_phases(phases_target)
-    print(f"-> Decomposition and current calculation completed in {time.time()-start_t:.3f}s")
+        # 1. Target: Generate a batch of Haar random unitaries (and make them "real-bordered")
+        u_target_raw = get_haar_unitary(n, batch_size)
+        u_target, _, _ = make_real_border(u_target_raw)
 
-    # 3. Vectorized Forward Propagation
-    phases_exp = processor.phases_from_currents(currents_target)
-    u_exp_raw = processor.U_from_phases(phases_exp)
+        # 2. Decomposition and Parallel Current Calculation
+        start_t = time.time()
+        phases_target = processor.phases_from_U(u_target, plot_graph=True)
+        currents_target = processor.currents_from_phases(phases_target)    
+        print(f"-> Decomposition and current calculation completed in {time.time()-start_t:.3f}s")
 
-    # 4. Final Real-Bordering
-    u_exp, _, _ = make_real_border(u_exp_raw)
+        # 3. Vectorized Forward Propagation
+        phases_exp = processor.phases_from_currents(currents_target)
+        u_exp_raw = processor.U_from_phases(phases_exp)
 
-    # 5. Fidelity Calculation (tools.fidelity intrinsically supports batches!)
-    # u_target = u_target.numpy() #TODO: remove this here
-    
-    fids = fidelity(u_target, u_exp)
+        # 4. Final Real-Bordering
+        u_exp, _, _ = make_real_border(u_exp_raw)
 
-    print("-" * 45, f"\nFinal Fidelities: {fids}")
+        # 5. Fidelity Calculation
+        fids = fidelity(u_target, u_exp)
 
-    if np.all(fids > 0.9999):
-        print("Test PASSED: Batch decomposition and propagation are accurate.")
-    else:
-        print("Warning: Fidelity is below the expected threshold.")
-    print("-" * 45)
+        print("-" * 45)
+        print( "Final Fidelities:\n"
+            f"  shape:  {list(fids.shape)}\n"
+            f"  dtype:  {fids.dtype}\n"
+            f"  device: {fids.device}\n"
+            f"  min/max: {fids.min():.2e} / {fids.max():.2e}"
+        )
+
+        if torch.all(fids > 0.9999):
+            print("Test PASSED: Batch decomposition and propagation are accurate.")
+        else:
+            print("Warning: Fidelity is below the expected threshold.")
+        print("-" * 45)
+
+    except Exception as e:
+        traceback.print_exc()
+
+    finally:
+        pass
