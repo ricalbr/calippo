@@ -1275,45 +1275,43 @@ if __name__ == "__main__":
         batch_size = 1000
         processor = Clements(n_modes=n)
 
-        print(f"\n--- Batch Testing ({batch_size} unitaries simultaneously) ---")
+        print(f" Batch Decomposition ".center(45, '-'))
 
-        # 1. Target: Generate a batch of Haar random unitaries (and make them "real-bordered")
+        # Generate a batch of Haar random unitaries (and make them "real-bordered")
         u_target_raw = get_haar_unitary(n, batch_size)
         u_target, _, _ = make_real_border(u_target_raw)
 
-        # 2. Decomposition and Parallel Current Calculation
-        start_t = time.time()
+        # Decomposition and Current-from-Phases Calculation
+        start_t = time.perf_counter()
         phases_target = processor.phases_from_U(u_target, plot_graph=True)
         currents_target = processor.currents_from_phases(phases_target)
-        print(f"-> Decomposition and current calculation completed in {time.time()-start_t:.3f}s")
+        print(
+            f"  Batch size: {batch_size}\n"
+            f"  U -> currents calculation in {time.perf_counter()-start_t:.3f} s"
+        )
 
-        # 3. Vectorized Forward Propagation
+        # 3 Experimental matrix retrieval
         phases_exp = processor.phases_from_currents(currents_target)
         u_exp_raw = processor.U_from_phases(phases_exp)
-
-        # 4. Final Real-Bordering
         u_exp, _, _ = make_real_border(u_exp_raw)
 
-        # 5. Fidelity Calculation
+        # Fidelity Calculation
         fids = fidelity(u_target, u_exp)
 
-        print("-" * 45)
+        print(" Fidelity calculation ".center(45, '-'))
         print(
-            "Final Fidelities:\n"
             f"  shape:  {list(fids.shape)}\n"
             f"  dtype:  {fids.dtype}\n"
             f"  device: {fids.device}\n"
             f"  min/max: {fids.min():.2e} / {fids.max():.2e}"
         )
+        print('-' * 45)
 
         if torch.all(fids > 0.9999):
-            print("Test PASSED: Batch decomposition and propagation are accurate.")
+            print("Test PASSED:\nDecomposition and propagation are accurate.")
         else:
             print("Warning: Fidelity is below the expected threshold.")
         print("-" * 45)
 
     except Exception as e:
         traceback.print_exc()
-
-    finally:
-        pass
