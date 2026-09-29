@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-Created on Mon Sep 21 13:57:51 2026
-
-@author: Francesco Ceccarelli
-
 Multi-start calibration of a UPP mesh (Bell/Clements) via gradient descent
 on the amplitude-only forward model, with a targeted "cross-talk escape"
 mechanism to recover from stagnation.
@@ -35,9 +30,10 @@ import numpy as np
 import copy
 import matplotlib.pyplot as plt
 import traceback
+import time
 
 from calippo.model import Bell, Clements
-from calippo.tools import amplitude_fidelity
+from calippo.tools import amplitude_fidelity, sinkhorn
 
 
 class CalibrationModel(nn.Module):
@@ -50,22 +46,16 @@ class CalibrationModel(nn.Module):
         self.mesh = mesh_instance
 
     def forward(self, currents):
-        # 1. Apply masks so gradients only flow through physically-meaningful
-        #    parameters (the optimizer must not "invent" nonexistent coupling
-        #    paths or heaters).
+        # Mask gradients to enforce physical parameters and prevent optimizer artifacts.
+        # (the optimizer must not "invent" nonexistent coupling paths or heaters).
         sp_active = self.mesh.static_phases * self.mesh.static_phases_mask
         xt_active = self.mesh.xtalk * self.mesh.xtalk_mask
 
-        # 2. Phase model: static phase + current-dependent cross-talk
-        #    contribution (mimics phases_from_currents, but masked).
+        # Phase model combining static offset and masked current-dependent cross-talk
         I2 = currents ** 2
         phases = sp_active + I2 @ xt_active.T
 
-        # 3. Native unitary propagation. No explicit "% 2*pi" here: U_from_phases
-        #    is itself 2*pi-periodic (it only ever consumes phases through
-        #    sin/cos), so wrapping manually would only introduce a spurious
-        #    gradient discontinuity every time a phase crosses a 2*pi boundary
-        #    without changing the physics.
+        # Native unitary propagation avoiding manual 2*pi wrapping to prevent gradient discontinuities.
         U = self.mesh.U_from_phases(phases)
         return torch.abs(U)
 
@@ -170,465 +160,544 @@ def circular_abs_error(a, b, period=2 * np.pi):
     return np.abs(diff)
 
 
+def load_data(
+    load_external: bool,
+    data_filepath: str | None = None,
+    train_ratio: float = 0.8,
+    mesh_class: type | None = None,
+    n_modes: int | None = None,
+    current_2pi: float | None = None,
+    mock_samples: int = 10_000,
+):
+
+    """Load experimental data from disk or synthesize mock data using a mesh model."""
+    if load_external:
+        if not data_filepath:
+            raise ValueError("`data_filepath` is required when `load_external=True`.")
+
+        print(f"Loading external experimental data from {data_filepath}...")
+        with open(data_filepath, 'rb') as f:
+            u_th = np.load(f)
+            U_np_reshaped = np.load(f)
+            currents = np.load(f)
+
+        # Convert to PyTorch tensors and compute U amplitude
+        I_exp = torch.from_numpy(currents).float()
+        U_exp = torch.sqrt(sinkhorn(torch.from_numpy(U_np_reshaped).cdouble())[0])
+    else:
+        print("Generating mock experimental data...")
+        gt_processor = mesh_class(n_modes=n_modes)
+
+        I_exp = gt_processor.generate_random_currents(current_ampl=current_2pi, batch_size=total_samples)
+
+        with torch.no_grad():
+            phases_exp = gt_processor.phases_from_currents(I_exp)
+            U_exp = gt_processor.U_from_phases(phases_exp)
+
+
+    # Amplitude matrix
+    U_mag_exp = torch.abs(U_exp)
+
+    # Dataset splitting
+    total_samples = len(I_exp)
+    n_train = int(total_samples * train_ratio)
+    n_test = total_samples - n_train
+
+    print(f"Total Samples: {total_samples} (Train: {n_train}, Test: {n_test})")
+
+    splits = (
+        (I_exp[:n_train], I_exp[n_train:]),
+        (U_exp[:n_train], U_exp[n_train:]),
+        (U_mag_exp[:n_train], U_mag_exp[n_train:]),
+    )
+
+    return splits
+
+def reinitialize_processor_parameters(processor, current_2pi: float) -> None:
+    """Reinitializes photonic processor static phases randomly in [0, 2π) and resets
+    the cross-talk matrix to ideal diagonal coupling, applying structural masks.
+    """
+    with torch.no_grad():
+        # Random uniform phases in [0, 2π) to explore diverse basins
+        random_phases = torch.rand(processor.n_phases, dtype=processor.static_phases.dtype) * 2 * torch.pi
+        processor.static_phases.copy_(random_phases)
+
+        # Reset cross-talk matrix to ideal (diagonal-only) scaled to produces a 2*pi phase shift with `current_2pi`
+        ideal_xtalk = torch.eye(
+            processor.n_phases,
+            dtype=processor.xtalk.dtype,
+            device=processor.xtalk.device,
+        )
+        processor.xtalk.copy_(ideal_xtalk)
+        processor.xtalk.mul_(2 * torch.pi / (current_2pi**2))
+
+        # Mask the output
+        processor.static_phases.mul_(processor.static_phases_mask)
+        processor.xtalk.mul_(processor.xtalk_mask)
+
+
+def targeted_xtalk_escape(
+    calib_model,
+    optimizer,
+    optimal_lr: float,
+    scheduler,
+    escape_attempts: int,
+    max_escape_attempts: int,
+    escape_patience: int,
+    epochs_no_improve: int,
+):
+    """Inspects the cross-talk matrix for statistical anomalies (diagonal self-efficiency and
+    off-diagonal coupling) and resets them along with corresponding static phases.
+
+    Returns:
+        Tuple containing updated (escape_attempts, epochs_no_improve, trigger_next_start,
+        scheduler).
+    """
+    trigger_next_start = False
+    scheduler = None
+
+    # Use inference_mode to avoid tracking autograd operations during targeted reset
+    with torch.inference_mode():
+        mesh = calib_model.mesh
+        xt_active = mesh.xtalk * mesh.xtalk_mask
+        n_p = xt_active.shape[0]
+
+        # Diagonal anomalies (self heater-efficiency)
+        diag = xt_active.diagonal()
+        diag_mask = mesh.xtalk_mask.diagonal().bool()
+
+        valid_diag = diag[diag_mask]
+        mean_diag = (
+            valid_diag.abs().mean().clamp_min(1e-8)
+            if valid_diag.numel() > 0
+            else torch.tensor(1e-8, device=diag.device)
+        )
+
+        # Flag diagonal entries deviating >50% from mean self-efficiency
+        diag_deviation = (diag.abs() - mean_diag).abs() / mean_diag
+        bad_diag_mask = (diag_deviation > 0.50) & diag_mask
+
+        # Off-diagonal anomalies (cross-heater coupling >30% of mean diagonal)
+        offdiag_mask = mesh.xtalk_mask.bool().clone()
+        offdiag_mask.fill_diagonal_(False)
+
+        offdiag_ratio_2d = mesh.xtalk.abs() / mean_diag
+        bad_offdiag_mask_2d = offdiag_mask & (offdiag_ratio_2d > 0.30)
+
+        has_bad_diag = bad_diag_mask.any()
+        has_bad_offdiag = bad_offdiag_mask_2d.any()
+
+        if has_bad_diag or has_bad_offdiag:
+            escape_attempts += 1
+
+            # Reset anomalous off-diagonal entries
+            if has_bad_offdiag:
+                mesh.xtalk.data[bad_offdiag_mask_2d] = torch.sign(mesh.xtalk.data[bad_offdiag_mask_2d])* 0.10 * mean_diag
+
+            # Reset anomalous diagonal entries & randomize static phases
+            if has_bad_diag:
+                diag_data = mesh.xtalk.data.diagonal()
+                diag_data[bad_diag_mask] = torch.sign(diag_data[bad_diag_mask]) * mean_diag
+
+                bad_sp_mask = bad_diag_mask & mesh.static_phases_mask.bool()
+                num_bad_sp = bad_sp_mask.sum().item()
+
+                if num_bad_sp > 0:
+                    mesh.static_phases.data[bad_sp_mask] = torch.rand(num_bad_sp,dtype=mesh.static_phases.dtype,device=mesh.static_phases.device)* 2* torch.pi
+
+
+            # Reset optimizer state to purge outdated momentum/second moments
+            epochs_no_improve = 0
+            optimizer.state.clear()
+            optimizer.param_groups[0]["lr"] = optimal_lr
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.5, patience=50)
+
+            num_bad_diag = bad_diag_mask.sum().item()
+            num_bad_offdiag = bad_offdiag_mask_2d.sum().item()
+
+            print(
+                f"\n[TARGETED XTALK ESCAPE] Reset {num_bad_diag} diagonal (with static phases) "
+                f"and {num_bad_offdiag} off-diagonal anomalous active coefficients "
+                f"(Attempt {escape_attempts}/{max_escape_attempts})."
+            )
+        else:
+            print(
+                f"\nLoss stagnated for {escape_patience} epochs, but no anomalous xtalk found. "
+                "Triggering next start..."
+            )
+            trigger_next_start = True
+
+    return escape_attempts, epochs_no_improve, trigger_next_start, scheduler
+
+
+@torch.inference_mode()
+def apply_xtalk_bounds(mesh: torch.nn.Module) -> None:
+    """Applies physical bounds to cross-talk matrix parameters based on mean heater efficiency.
+
+    Diagonal self-efficiency entries are clamped within 50% of their mean
+    magnitude. Active off-diagonal coupling terms are clamped within 30% of the
+    mean diagonal magnitude.
+    """
+    # Extract diagonal view and active mask
+    # Extract zero-copy diagonal view and active mask
+    diag = mesh.xtalk.diagonal()  # type: ignore[attr-defined]
+    diag_mask = mesh.xtalk_mask.diagonal().bool()  # type: ignore[attr-defined]
+
+    valid_diag = diag[diag_mask]
+    if valid_diag.numel() == 0:
+        return
+
+    # Compute mean self-efficiency magnitude
+    mean_diag = valid_diag.abs().mean().clamp_min(1e-8)
+
+    # Clamp active diagonal entries preserving sign: [0.50 * mean, 1.50 * mean]
+    min_diag_mag = 0.50 * mean_diag
+    max_diag_mag = 1.50 * mean_diag
+
+    diag_sign = torch.sign(diag)
+    # Handle exact zero signs by preserving positive magnitude default
+    diag_sign[diag_sign == 0] = 1.0
+
+    clamped_diag_mag = diag.abs().clamp(min=min_diag_mag, max=max_diag_mag)
+    diag.copy_(diag_sign * clamped_diag_mag)
+
+    # 2. Clamp active off-diagonal magnitudes preserving sign: [0, 0.30 * mean]
+    offdiag_mask = mesh.xtalk_mask.bool().clone()  # type: ignore[attr-defined]
+    offdiag_mask.fill_diagonal_(False)
+
+    max_offdiag_mag = 0.30 * mean_diag
+    offdiag_data = mesh.xtalk.data[offdiag_mask]  # type: ignore[attr-defined]
+
+    offdiag_sign = torch.sign(offdiag_data)
+    offdiag_sign[offdiag_sign == 0] = 1.0
+
+    clamped_offdiag_mag = offdiag_data.abs().clamp(max=max_offdiag_mag)
+    mesh.xtalk.data[offdiag_mask] = offdiag_sign * clamped_offdiag_mag  # type: ignore[attr-defined]
+
+
+def run_start_diagnostics(
+    start_idx: int,
+    start_failed: bool,
+    final_test_fid: float,
+    calib_model: torch.nn.Module,
+    circular_abs_error,
+    gt_processor: torch.nn.Module | None = None,
+    plot_per_start:bool = False,
+) -> None:
+    """Logs parameter estimation diagnostics and plots errors or estimated maps.
+    Evaluates both ground-truth comparison (if available) and experimental data
+    parameter visualisations.
+    """
+    status_str = "Failed to reach target" if start_failed else "Successfully reached target"
+    print(
+        f"\n[DIAGNOSTICS] Start {start_idx + 1} {status_str} "
+        f"(Final Test Fid: {final_test_fid:.5f})."
+    )
+
+    with torch.inference_mode():
+        mesh = calib_model.mesh  # type: ignore[attr-defined]
+        est_sp = np.mod((mesh.static_phases * mesh.static_phases_mask).cpu().numpy(), 2 * np.pi)
+        est_xt = (mesh.xtalk * mesh.xtalk_mask).cpu().numpy()
+
+    if gt_processor is not None:
+        print("Analyzing parameter errors against Ground Truth...")
+        with torch.inference_mode():
+            gt_sp = np.mod((gt_processor.static_phases * gt_processor.static_phases_mask).cpu().numpy(), 2 * np.pi)
+            gt_xt = (gt_processor.xtalk * gt_processor.xtalk_mask).cpu().numpy()
+
+            sp_mask_np = gt_processor.static_phases_mask.cpu().numpy().astype(bool)
+            xt_mask_np = (gt_processor.xtalk_mask.cpu().numpy() > 0)
+
+        sp_error = circular_abs_error(est_sp, gt_sp)
+        xt_error = np.abs(est_xt - gt_xt)
+
+        print(
+            f"  -> Static Phases [0, 2pi] - Max Circular Error: {np.max(sp_error):.4e} | "
+            f"Mean Error: {np.mean(sp_error[sp_mask_np]):.4e}"
+        )
+        print(
+            f"  -> Cross-Talk Matrix - Max Absolute Error: {np.max(xt_error):.4e} | "
+            f"Mean Error: {np.mean(xt_error[xt_mask_np]):.4e}"
+        )
+
+        worst_sp_idx = int(np.argmax(sp_error))
+        print(
+            f"  -> Worst Static Phase index: {worst_sp_idx} "
+            f"(Est: {est_sp[worst_sp_idx]:.4f}, GT: {gt_sp[worst_sp_idx]:.4f})"
+        )
+
+        worst_xt_idx = np.unravel_index(np.argmax(xt_error), xt_error.shape)
+        print(
+            f"  -> Worst Cross-Talk coordinates: {worst_xt_idx} "
+            f"(Est: {est_xt[worst_xt_idx]:.4f}, GT: {gt_xt[worst_xt_idx]:.4f})"
+        )
+
+        if plot_per_start:
+            fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+            im0 = axes[0].imshow(est_xt - gt_xt, cmap="coolwarm", aspect="auto")
+            axes[0].set_title(f"Start {start_idx + 1}: Cross-Talk Error (Est - GT)")
+            fig.colorbar(im0, ax=axes[0])
+
+            axes[1].plot(gt_sp, label="GT Static Phases", marker="o", alpha=0.7)
+            axes[1].plot(
+                est_sp, label="Est Static Phases [0, 2pi]", marker="x", alpha=0.7
+            )
+            axes[1].set_title(f"Start {start_idx + 1}: Static Phases Comparison")
+            axes[1].legend()
+            axes[1].grid(True, linestyle=":", alpha=0.6)
+
+            plt.tight_layout()
+            plt.show()
+
+    else:
+        if plot_per_start:
+            print(
+                "Plotting estimated parameters (No Ground Truth available for experimental data)..."
+            )
+
+            fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+            im0 = axes[0].imshow(est_xt, cmap="viridis", aspect="auto")
+            axes[0].set_title(f"Start {start_idx + 1}: Estimated Cross-Talk Matrix")
+            fig.colorbar(im0, ax=axes[0])
+
+            axes[1].plot(
+                est_sp, label="Est Static Phases [0, 2pi]", marker="x", color="orange"
+            )
+            axes[1].set_title(f"Start {start_idx + 1}: Estimated Static Phases")
+            axes[1].legend()
+            axes[1].grid(True, linestyle=":", alpha=0.6)
+
+            plt.tight_layout()
+            plt.show()
+
+
 if __name__ == "__main__":
 
     calib_model = None
     gt_processor = None
 
-    try:
-        # ==========================================
-        # CONFIGURATION
-        # ==========================================
-        mesh_choice = "Clements"
-        MeshClass = Bell if mesh_choice == "Bell" else Clements
-
-        n = 6
-        train_ratio = 0.8
-        current_2pi = 16
-
-        load_external_data = True
-        data_filepath = "unitary_measurement_20260121_1.npy"
-
-        # --- Multi-start configuration ---
-        num_starts = 10              # max number of independent random restarts
-        target_fidelity = 0.9985     # stop as soon as a start reaches this test fidelity
-        check_interval = 100         # epochs between test-set evaluations
-        max_global_epochs = 100000    # hard cap on epochs summed across ALL starts
-
-        # --- Stagnation & targeted escape configuration ---
-        escape_patience = 200        # epochs with no raw-loss improvement before an escape is considered
-        max_escape_attempts = 5      # escapes allowed within a single start before giving up on it
-        min_loss_delta = 1e-6        # minimum absolute MSE improvement to NOT count as stagnation
-
-        # Diagnostics-only knob: the LR-finder plot is informative but
-        # produces one figure per start. Default to showing it only once
-        # (first start) to avoid flooding the notebook with 10 near-identical
-        # plots; set to True to see it for every start.
-        plot_lr_finder_every_start = True
-
-        # ==========================================
-        # 1. DATA GENERATION / LOADING
-        # ==========================================
-        if load_external_data:
-            print(f"Loading external experimental data from {data_filepath}...")
-
-            with open(data_filepath, 'rb') as f:
-                u_th = np.load(f)
-                U_np_reshaped = np.load(f)
-                currents = np.load(f)
-
-            loaded_data = np.load(data_filepath, allow_pickle=True)
-            if isinstance(loaded_data, np.ndarray) and loaded_data.size == 1:
-                loaded_data = loaded_data.item()
-
-            from calippo.tools import sinkhorn
-            
-
-            I_exp = torch.tensor(currents, dtype=torch.float32)
-            # U_np_reshaped = loaded_data['Us'].reshape(loaded_data['Us'].shape[0], n, n)
-            U_exp = torch.tensor(U_np_reshaped, dtype=torch.complex128)
-            U_exp = torch.sqrt(sinkhorn(U_exp)[0])
-            U_mag_exp = torch.abs(U_exp)
-
-            total_samples = I_exp.shape[0]
-            n_train = int(total_samples * train_ratio)
-            n_test = total_samples - n_train
-        else:
-            print("Generating mock experimental data...")
-            total_samples = 10000
-            n_train = int(total_samples * train_ratio)
-            n_test = total_samples - n_train
-
-            # Ground-truth processor used only to synthesize data; kept around
-            # afterwards so the diagnostics section below can compare the
-            # fitted parameters against the true ones.
-            gt_processor = MeshClass(n_modes=n)
-            I_exp = gt_processor.generate_random_currents(current_ampl=current_2pi, batch_size=total_samples)
-            with torch.no_grad():
-                phases_exp = gt_processor.phases_from_currents(I_exp)
-                U_exp = gt_processor.U_from_phases(phases_exp)
-                U_mag_exp = torch.abs(U_exp)
-
-        print(f"Total Samples: {total_samples} (Train: {n_train}, Test: {n_test})")
-
-        I_train, I_test = I_exp[:n_train], I_exp[n_train:]
-        U_train, U_test = U_exp[:n_train], U_exp[n_train:]
-        U_mag_train, U_mag_test = U_mag_exp[:n_train], U_mag_exp[n_train:]
-
-        # ==========================================
-        # MULTI-START OPTIMIZATION LOOP
-        # ==========================================
-        best_overall_fidelity = -1.0
-        best_model_weights = None
-        interrupted = False  # set to True on a user-requested Ctrl+C stop
-
-        # Epoch counter and loss-history lists are shared across ALL starts,
-        # so the final convergence plot shows one continuous timeline rather
-        # than restarting from zero at each start.
-        global_epoch = 0
-        continuous_epochs = []
-        continuous_train_infid = []
-        continuous_test_infid = []
-
-        # The mesh/model are created once and reused across starts; each
-        # start just reinitializes their parameters in-place (see below).
-        processor = MeshClass(n_modes=n)
-        calib_model = CalibrationModel(processor)
-
-        criterion = nn.MSELoss()
-
-        for start_idx in range(num_starts):
-            if global_epoch >= max_global_epochs:
-                break
-
-            print(f" START {start_idx + 1}/{num_starts} ".center(75, '='))
-
-            # --- Random reinitialization for this start ---
-            # Static phases: uniform random in [0, 2*pi) (unlike a single
-            # fixed "in the dark" init, this is what actually gives the
-            # multi-start its diversity of basins to explore).
-            # Cross-talk: reset to the ideal (diagonal-only) coupling,
-            # scaled so that a current of `current_2pi` produces a 2*pi
-            # phase shift on its own heater.
-            with torch.no_grad():
-                random_phases = torch.rand(processor.n_phases, dtype=processor.static_phases.dtype) * 2 * torch.pi
-                processor.static_phases.copy_(random_phases)
-
-                processor.xtalk.copy_(torch.eye(processor.n_phases, dtype=processor.xtalk.dtype))
-                processor.xtalk.mul_(2 * torch.pi / current_2pi**2)
-
-                processor.static_phases.mul_(processor.static_phases_mask)
-                processor.xtalk.mul_(processor.xtalk_mask)
-
-            optimizer = optim.Adam(calib_model.parameters(), lr=1e-7)
-
-            print("Running automated LR finder...")
-            try:
-                optimal_lr = lr_finder(
-                    calib_model, optimizer, criterion, I_train, U_mag_train,
-                    plot_result=(plot_lr_finder_every_start or start_idx == 0),
-                )
-            except KeyboardInterrupt:
-                # Ctrl+C during the LR sweep: nothing meaningful has been
-                # trained yet for this start, so just stop the whole search
-                # and fall through to the final evaluation with whatever the
-                # best previous start achieved (if any).
-                print("\n[INTERRUPTED] Ctrl+C received during LR finder. Stopping the search.")
-                interrupted = True
-                break
-            optimizer.param_groups[0]['lr'] = optimal_lr
-
-            scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=50)
-
-            best_loss_this_start = float('inf')
-            epochs_no_improve = 0
-            escape_attempts = 0
-            final_test_fid = 0.0
-            start_failed = True  # optimistic default flipped to False only on target reached
-
-            print(f"Starting training (Target Fidelity: {target_fidelity})...")
-
-            while True:
-                global_epoch += 1
-
-                if global_epoch > max_global_epochs:
-                    print(f"\nMax global epochs ({max_global_epochs}) reached! Terminating optimization.")
-                    break
-
-                # --- TRAIN STEP ---
-                # This is where the process spends nearly all of its time, so
-                # it's the most likely place to catch a Ctrl+C. On interrupt:
-                # stop training for this start cleanly (keep whatever was
-                # already learned), run its diagnostics as usual, then let
-                # the surrounding loops see `interrupted` and unwind straight
-                # to the final evaluation/plots instead of crashing.
-                try:
-                    calib_model.train()
-                    optimizer.zero_grad()
-
-                    U_mag_pred_train = calib_model(I_train)
-                    loss_train = criterion(U_mag_pred_train, U_mag_train)
-
-                    loss_train.backward()
-                    optimizer.step()
-                    scheduler.step(loss_train.detach())
-                except KeyboardInterrupt:
-                    print(f"\n[INTERRUPTED] Ctrl+C received at Global Epoch {global_epoch}. "
-                          f"Stopping training and moving to final evaluation with the best model found so far.")
-                    interrupted = True
-                    break
-
-                # --- STAGNATION TRACKING ---
-                # Absolute (not relative) improvement of the raw training MSE,
-                # checked every epoch. Using an absolute threshold avoids the
-                # failure mode where a shrinking LR (via the scheduler) makes
-                # the *relative* improvement look small even on a run that is
-                # still converging normally.
-                if loss_train.item() < best_loss_this_start - min_loss_delta:
-                    best_loss_this_start = loss_train.item()
-                    epochs_no_improve = 0
-                else:
-                    epochs_no_improve += 1
-
-                # --- PERIODIC TEST-SET EVALUATION ---
-                if global_epoch % check_interval == 0:
-                    calib_model.eval()
-                    with torch.no_grad():
-                        U_mag_pred_test = calib_model(I_test)
-
-                        mean_fid_train = amplitude_fidelity(U_train, U_mag_pred_train).mean().item()
-                        mean_fid_test = amplitude_fidelity(U_test, U_mag_pred_test).mean().item()
-
-                    current_lr = optimizer.param_groups[0]['lr']
-                    infidelity_train = 1.0 - mean_fid_train
-                    infidelity_test = 1.0 - mean_fid_test
-
-                    continuous_epochs.append(global_epoch)
-                    continuous_train_infid.append(infidelity_train)
-                    continuous_test_infid.append(infidelity_test)
-
-                    print(f"Global Epoch {global_epoch:6d} | LR: {current_lr:.2e} | "
-                          f"Train Fid: {mean_fid_train:.5f} | Test Fid: {mean_fid_test:.5f} | Loss: {loss_train.item():.2e}")
-
-                    final_test_fid = mean_fid_test
-
-                    if final_test_fid > best_overall_fidelity:
-                        best_overall_fidelity = final_test_fid
-                        best_model_weights = copy.deepcopy(calib_model.state_dict())
-
-                    if mean_fid_test >= target_fidelity:
-                        print(f"\nTarget testing fidelity reached at Global Epoch {global_epoch}!")
-                        start_failed = False
-                        break
-
-                # ----------------------------------------------------------
-                # TARGETED CROSS-TALK ESCAPE
-                # ----------------------------------------------------------
-                # Rather than perturbing every parameter blindly, inspect the
-                # cross-talk matrix for entries that are statistical outliers
-                # relative to the fitted diagonal (heater self-efficiency),
-                # and reset only those -- plus the static phase tied to any
-                # anomalous diagonal entry, since a bad heater-efficiency
-                # estimate is often compensated by an equally-wrong static
-                # phase, and the two need to be broken out of that joint
-                # local minimum together.
-                if epochs_no_improve >= escape_patience:
-                    if escape_attempts < max_escape_attempts:
-                        with torch.no_grad():
-                            mesh = calib_model.mesh
-                            xt_active = mesh.xtalk * mesh.xtalk_mask
-                            n_p = xt_active.shape[0]
-
-                            # 1. Diagonal anomalies (self heater-efficiency)
-                            diag_idx = torch.arange(n_p, device=mesh.xtalk.device)
-                            diag = xt_active[diag_idx, diag_idx]
-                            diag_mask = mesh.xtalk_mask[diag_idx, diag_idx].bool()
-
-                            valid_diag = diag[diag_mask]
-                            if len(valid_diag) > 0:
-                                mean_diag = valid_diag.abs().mean().clamp_min(1e-8)
-                            else:
-                                mean_diag = torch.tensor(1e-8, device=diag.device)
-
-                            # Flag diagonal entries that deviate from the mean
-                            # self-efficiency by more than 50%.
-                            diag_deviation = (diag.abs() - mean_diag).abs() / mean_diag
-                            bad_diag_mask = (diag_deviation > 0.50) & diag_mask
-
-                            # 2. Off-diagonal anomalies (cross-heater coupling)
-                            offdiag_mask = (mesh.xtalk_mask.bool() & (~torch.eye(n_p, dtype=torch.bool, device=mesh.xtalk.device)))
-                            offdiag_ratio_2d = mesh.xtalk.abs() / mean_diag
-
-                            # Flag off-diagonal entries exceeding 30% of the
-                            # mean diagonal magnitude (implausibly strong
-                            # cross-talk for a well-behaved mesh).
-                            bad_offdiag_mask_2d = offdiag_mask & (offdiag_ratio_2d > 0.30)
-
-                            has_bad_diag = bad_diag_mask.any()
-                            has_bad_offdiag = bad_offdiag_mask_2d.any()
-
-                            if has_bad_diag or has_bad_offdiag:
-                                escape_attempts += 1
-
-                                # Reset anomalous off-diagonal entries to a
-                                # small, physically-plausible coupling
-                                # (10% of the mean diagonal), preserving sign.
-                                if has_bad_offdiag:
-                                    target_offdiag = 0.10 * mean_diag
-                                    mesh.xtalk.data[bad_offdiag_mask_2d] = torch.sign(mesh.xtalk.data[bad_offdiag_mask_2d]) * target_offdiag
-
-                                # Reset anomalous diagonal entries to the mean
-                                # self-efficiency, and randomize the static
-                                # phase of the corresponding heater to break
-                                # the joint (efficiency, phase) local minimum.
-                                if has_bad_diag:
-                                    bad_diag_indices = diag_idx[bad_diag_mask]
-                                    target_diag = mean_diag
-
-                                    mesh.xtalk.data[bad_diag_indices, bad_diag_indices] = torch.sign(mesh.xtalk.data[bad_diag_indices, bad_diag_indices]) * target_diag
-
-                                    bad_sp_mask = bad_diag_mask & mesh.static_phases_mask.bool()
-                                    bad_sp_indices = diag_idx[bad_sp_mask]
-
-                                    if len(bad_sp_indices) > 0:
-                                        random_phases = torch.rand(len(bad_sp_indices), dtype=mesh.static_phases.dtype, device=mesh.static_phases.device) * 2 * torch.pi
-                                        mesh.static_phases.data[bad_sp_indices] = random_phases
-
-                                # Reset Adam's momentum/second-moment state:
-                                # after a targeted parameter reset, the old
-                                # statistics no longer describe the local
-                                # curvature and would misdirect the first few
-                                # post-escape steps.
-                                optimizer.state.clear()
-                                epochs_no_improve = 0
-                                optimizer.param_groups[0]['lr'] = optimal_lr
-                                scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.9, patience=100)
-
-                                num_bad_diag = bad_diag_mask.sum().item()
-                                num_bad_offdiag = bad_offdiag_mask_2d.sum().item()
-
-                                print(f"\n[TARGETED XTALK ESCAPE] Reset {num_bad_diag} diagonal (with static phases) and {num_bad_offdiag} off-diagonal "
-                                      f"anomalous active coefficients (Attempt {escape_attempts}/{max_escape_attempts}).")
-                            else:
-                                # Stagnation isn't explained by an anomalous
-                                # cross-talk entry -- the basin is assumed
-                                # exhausted, so move on to a fresh start
-                                # rather than keep grinding on it.
-                                print(f"\nLoss stagnated for {escape_patience} epochs, but no anomalous xtalk found. Triggering next start...")
-                                break
-                    else:
-                        print(f"\nMax escape attempts ({max_escape_attempts}) reached. Triggering next start...")
-                        break
-
-            # ==========================================
-            # PER-START DIAGNOSTICS
-            # ==========================================
-            # Printed/plotted for EVERY start, successful or not, since a
-            # failed start's parameter map is often the most informative one
-            # for spotting a systematic issue with the escape heuristics.
-            status_str = "failed to reach target" if start_failed else "successfully reached target"
-            print(f"\n[DIAGNOSTICS] Start {start_idx + 1} {status_str} (Final Test Fid: {final_test_fid:.5f}).")
-
-            with torch.no_grad():
-                est_sp = np.mod((calib_model.mesh.static_phases * calib_model.mesh.static_phases_mask).cpu().numpy(), 2 * np.pi)
-                est_xt = (calib_model.mesh.xtalk * calib_model.mesh.xtalk_mask).cpu().numpy()
-
-            if gt_processor is not None:
-                # Mock data: ground truth is available, so report fit errors.
-                print("Analyzing parameter errors against Ground Truth...")
-                with torch.no_grad():
-                    gt_sp = np.mod((gt_processor.static_phases * gt_processor.static_phases_mask).cpu().numpy(), 2 * np.pi)
-                    gt_xt = (gt_processor.xtalk * gt_processor.xtalk_mask).cpu().numpy()
-
-                # Static phases are circular quantities: use the wrap-around
-                # aware distance so that e.g. 0.01 rad vs 6.27 rad is
-                # correctly reported as a ~0.02 rad error, not a ~6.26 rad
-                # error (see `circular_abs_error` docstring).
-                sp_error = circular_abs_error(est_sp, gt_sp)
-                xt_error = np.abs(est_xt - gt_xt)
-
-                print(f"  -> Static Phases [0, 2pi] - Max Circular Error: {np.max(sp_error):.4e} | Mean Error: {np.mean(sp_error[gt_processor.static_phases_mask.cpu().numpy()]):.4e}")
-                print(f"  -> Cross-Talk Matrix - Max Absolute Error: {np.max(xt_error):.4e} | Mean Error: {np.mean(xt_error[gt_processor.xtalk_mask.cpu().numpy() > 0]):.4e}")
-
-                worst_sp_idx = np.argmax(sp_error)
-                print(f"  -> Worst Static Phase index: {worst_sp_idx} (Est: {est_sp[worst_sp_idx]:.4f}, GT: {gt_sp[worst_sp_idx]:.4f})")
-
-                worst_xt_idx = np.unravel_index(np.argmax(xt_error), xt_error.shape)
-                print(f"  -> Worst Cross-Talk coordinates: {worst_xt_idx} (Est: {est_xt[worst_xt_idx]:.4f}, GT: {gt_xt[worst_xt_idx]:.4f})")
-
-                fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-                im0 = axes[0].imshow(est_xt - gt_xt, cmap='coolwarm', aspect='auto')
-                axes[0].set_title(f"Start {start_idx + 1}: Cross-Talk Error (Est - GT)")
-                fig.colorbar(im0, ax=axes[0])
-
-                axes[1].plot(gt_sp, label='GT Static Phases', marker='o', alpha=0.7)
-                axes[1].plot(est_sp, label='Est Static Phases [0, 2pi]', marker='x', alpha=0.7)
-                axes[1].set_title(f"Start {start_idx + 1}: Static Phases Comparison")
-                axes[1].legend()
-                axes[1].grid(True, linestyle=":", alpha=0.6)
-
-                plt.tight_layout()
-                plt.show()
-
+    mesh_choice = "Clements"
+    MeshClass = Bell if mesh_choice == "Bell" else Clements
+
+    n = 6
+    train_ratio = 0.8
+    current_2pi = 17 # mA
+
+    load_external_data = True
+    data_filepath = "unitary_measurement_20260121_1.npy"
+
+    # --- Multi-start configuration ---
+    num_starts = 10              # max number of independent random restarts
+    target_fidelity = 0.9985     # stop as soon as a start reaches this test fidelity
+    check_interval = 100         # epochs between test-set evaluations
+    max_global_epochs = 100_000    # hard cap on epochs summed across ALL starts
+
+    # --- Stagnation & targeted escape configuration ---
+    escape_patience = 200        # epochs with no raw-loss improvement before an escape is considered
+    max_escape_attempts = 5      # escapes allowed within a single start before giving up on it
+    min_loss_delta = 1e-6        # minimum absolute MSE improvement to NOT count as stagnation
+
+    # --- Diagnostics ---
+    plot_lr_finder = False      # Show LR-finder plot only on first start by default to avoid notebook clutter
+    plot_per_start = False      # Show per-start diagnostic plot
+
+    # --- Data Loading ---
+    (I_train, I_test), (U_train, U_test), (U_mag_train, U_mag_test) = load_data(
+        load_external=True,
+        data_filepath = data_filepath,
+        mesh_class=MeshClass,
+        n_modes=n,
+        current_2pi=current_2pi,
+        train_ratio=train_ratio,
+    )
+
+    # MULTI-START OPTIMIZATION LOOP
+    best_overall_fidelity = -1.0
+    best_model_weights = None
+    interrupted = False  # set to True on a user-requested Ctrl+C stop
+
+    # Epoch counter and loss-history lists are shared across ALL starts,
+    # so the final convergence plot shows one continuous timeline rather
+    # than restarting from zero at each start.
+    global_epoch = 0
+    continuous_epochs = []
+    continuous_train_infid = []
+    continuous_test_infid = []
+
+    # The mesh/model are created once and reused across starts; each
+    # start just reinitializes their parameters in-place (see below).
+    processor = MeshClass(n_modes=n)
+    calib_model = CalibrationModel(processor)
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(calib_model.parameters(), lr=1e-7)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.5, patience=100)
+
+    for start_idx in range(num_starts):
+        print(f" START {start_idx + 1}/{num_starts} ".center(75, '='))
+
+        if global_epoch >= max_global_epochs:
+            print(f"Max global epochs ({max_global_epochs}) reached. Terminating optimization.")
+            break
+
+        reinitialize_processor_parameters(processor, current_2pi)
+
+        print("Running automated LR finder...")
+        optimal_lr = lr_finder(
+            calib_model,
+            optimizer,
+            criterion,
+            I_train,
+            U_mag_train,
+            plot_result=(plot_lr_finder or start_idx == 0),
+        )
+        optimizer.param_groups[0]["lr"] = optimal_lr
+        optimizer.state.clear()
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.5, patience=100)
+
+        best_loss_this_start = float('inf')
+        epochs_no_improve = 0
+        escape_attempts = 0
+        final_test_fid = 0.0
+        start_failed = True  # optimistic default flipped to False only on target reached
+
+        print(f"Starting training (Target Fidelity: {target_fidelity})...")
+        start_time = time.perf_counter()
+
+        for global_epoch in range(global_epoch, max_global_epochs):
+
+            calib_model.train()
+            optimizer.zero_grad(set_to_none=False)
+            U_mag_pred_train = calib_model(I_train)
+            loss_train = criterion(U_mag_pred_train, U_mag_train)
+            loss_train.backward()
+            optimizer.step()
+            # apply_xtalk_bounds(calib_model.mesh)
+            scheduler.step(loss_train.detach())
+
+            # --- STAGNATION TRACKING ---
+            current_loss = loss_train.item()
+
+            # Absolute improvement of the training MSE.
+            if current_loss < best_loss_this_start - min_loss_delta:
+                best_loss_this_start = current_loss
+                epochs_no_improve = 0
             else:
-                # Real experimental data: no ground truth, just show the estimates.
-                print("Plotting estimated parameters (No Ground Truth available for experimental data)...")
+                epochs_no_improve += 1
 
-                fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-                im0 = axes[0].imshow(est_xt, cmap='viridis', aspect='auto')
-                axes[0].set_title(f"Start {start_idx + 1}: Estimated Cross-Talk Matrix")
-                fig.colorbar(im0, ax=axes[0])
+            # --- PERIODIC TEST-SET EVALUATION ---
+            if global_epoch % check_interval == 0:
+                elapsed_time = time.perf_counter() - start_time
+                start_time = time.perf_counter()
 
-                axes[1].plot(est_sp, label='Est Static Phases [0, 2pi]', marker='x', color='orange')
-                axes[1].set_title(f"Start {start_idx + 1}: Estimated Static Phases")
-                axes[1].legend()
-                axes[1].grid(True, linestyle=":", alpha=0.6)
+                calib_model.eval()
+                with torch.inference_mode():
+                    U_mag_pred_test = calib_model(I_test)
 
-                plt.tight_layout()
-                plt.show()
+                    mean_fid_train = amplitude_fidelity(U_train, U_mag_pred_train.detach()).mean().item()
+                    mean_fid_test = amplitude_fidelity(U_test, U_mag_pred_test).mean().item()
 
-            if interrupted or best_overall_fidelity >= target_fidelity or global_epoch >= max_global_epochs:
-                if best_overall_fidelity >= target_fidelity:
-                    print("\nGlobal target fidelity achieved! Terminating multi-start search early.")
-                break
+                print(
+                    f"Global Epoch {global_epoch:6d} |",
+                    f"LR: {optimizer.param_groups[0]['lr']:.2e} |",
+                    f"Train Fid: {mean_fid_train:.5f} |",
+                    f"Test Fid: {mean_fid_test:.5f} |",
+                    f"Loss: {loss_train.item():.2e} |",
+                    f"Elapsed time: {elapsed_time:.2f} s",
+                )
 
-        # ==========================================
-        # FINAL EVALUATION & VISUALIZATIONS
-        # ==========================================
-        if interrupted:
-            print("\nSearch interrupted by user (Ctrl+C).")
+                continuous_epochs.append(global_epoch)
+                continuous_train_infid.append(1.0 - mean_fid_train)
+                continuous_test_infid.append(1.0 - mean_fid_test)
 
-        if best_model_weights is not None:
-            print(f"Loading best model with Test Fidelity: {best_overall_fidelity:.5f}")
-            calib_model.load_state_dict(best_model_weights)
-        else:
-            # Interrupted before any check_interval evaluation ever ran (e.g.
-            # within the first `check_interval` epochs of the very first
-            # start): there is no tracked "best" checkpoint yet, so fall back
-            # to whatever the model currently holds rather than crashing on
-            # `load_state_dict(None)`.
-            print("No checkpoint was recorded yet (interrupted very early) -- "
-                  "evaluating the current, largely untrained model instead.")
-        calib_model.eval()
+                if mean_fid_test > best_overall_fidelity:
+                    best_overall_fidelity = mean_fid_test
+                    best_model_weights = {
+                        k: v.clone() for k, v in calib_model.state_dict().items()
+                    }
 
-        with torch.no_grad():
-            U_mag_pred_final_test = calib_model(I_test)
-            final_test_fidelities = amplitude_fidelity(U_test, U_mag_pred_final_test).numpy()
+                if mean_fid_test >= target_fidelity:
+                    print(f"Target testing fidelity reached at Global Epoch {global_epoch}!")
+                    start_failed = False
+                    break
 
-        # Plot 1: full training history across ALL starts on one timeline.
-        plt.figure(figsize=(9, 5))
-        plt.semilogy(continuous_epochs, continuous_train_infid, color='blue', label='Train Set', marker='o', markersize=3, linestyle='-')
-        plt.semilogy(continuous_epochs, continuous_test_infid, color='orange', label='Test Set', marker='x', markersize=3, linestyle='--')
-        plt.xlabel('Global Epoch', fontsize=12)
-        plt.ylabel('Mean Infidelity (1 - F)', fontsize=12)
-        plt.title('Continuous Shotgun Optimization (Train vs Test)', fontsize=14)
-        plt.grid(True, which="both", ls="--", alpha=0.5)
-        plt.legend()
-        plt.tight_layout()
-        plt.show()
+            # --- TARGETED CROSS-TALK ESCAPE ---
+            if epochs_no_improve >= escape_patience:
+                if escape_attempts >= max_escape_attempts:
+                    print(f"\nMax escape attempts ({max_escape_attempts}) reached. Triggering next start...")
+                    break
+                else:
+                    escape_attempts, epochs_no_improve, trigger_next_start, scheduler = targeted_xtalk_escape(
+                        calib_model=calib_model,
+                        optimizer=optimizer,
+                        optimal_lr=optimal_lr,
+                        scheduler=scheduler,
+                        escape_attempts=escape_attempts,
+                        max_escape_attempts=max_escape_attempts,
+                        escape_patience=escape_attempts,
+                        epochs_no_improve=epochs_no_improve,
+                    )
 
-        # Plot 2: distribution of per-sample fidelities for the best model found.
-        plt.figure(figsize=(8, 5))
-        plt.hist(final_test_fidelities, bins=30, color='green', alpha=0.7, edgecolor='black')
-        plt.xlabel('Amplitude Fidelity', fontsize=12)
-        plt.ylabel('Frequency', fontsize=12)
-        plt.title(f'Best Test Fidelities Distribution (Mean: {np.mean(final_test_fidelities):.4f})', fontsize=14)
-        plt.grid(True, ls="--", alpha=0.5)
-        plt.tight_layout()
-        plt.show()
+        # --- END OF RUN DIAGNOSTICS ---
+        run_start_diagnostics(
+            start_idx=start_idx,
+            start_failed=start_failed,
+            final_test_fid=final_test_fid,
+            calib_model=calib_model,
+            circular_abs_error=circular_abs_error,
+            gt_processor=gt_processor,
+        )
 
-    except KeyboardInterrupt:
-        # Safety net: catches a Ctrl+C that slips through somewhere not
-        # explicitly wrapped above (e.g. while a blocking plt.show() window
-        # is open). We may be mid-computation with no clean "best model" to
-        # fall back on here, so just exit quietly instead of dumping a stack
-        # trace -- whatever was already printed/plotted up to this point is
-        # still there for inspection.
-        print("\n[INTERRUPTED] Ctrl+C received. Exiting cleanly without further evaluation.")
+        # --- TERMINATION CHECK ---
+        if (
+            interrupted
+            or best_overall_fidelity >= target_fidelity
+            or global_epoch >= max_global_epochs
+        ):
+            if best_overall_fidelity >= target_fidelity:
+                print("\nGlobal target fidelity achieved! Terminating multi-start search early.")
+            break
 
-    except Exception as e:
-        traceback.print_exc()
+    # FINAL EVALUATION & VISUALIZATIONS
+    if interrupted:
+        print("\nSearch interrupted by user (Ctrl+C).")
 
-    finally:
-        if calib_model is not None:
-            pass
+    if best_model_weights is not None:
+        print(f"Loading best model with Test Fidelity: {best_overall_fidelity:.5f}")
+        calib_model.load_state_dict(best_model_weights)
+    else:
+        # Interrupted before any check_interval evaluation ever ran (e.g.
+        # within the first `check_interval` epochs of the very first
+        # start): there is no tracked "best" checkpoint yet, so fall back
+        # to whatever the model currently holds rather than crashing on
+        # `load_state_dict(None)`.
+        print("No checkpoint was recorded yet (interrupted very early) -- "
+                "evaluating the current, largely untrained model instead.")
+
+    calib_model.eval()
+
+    with torch.no_grad():
+        U_mag_pred_final_test = calib_model(I_test)
+        final_test_fidelities = amplitude_fidelity(U_test, U_mag_pred_final_test).numpy()
+
+    # Full training history across ALL starts on one timeline.
+    plt.figure(figsize=(9, 5))
+    plt.semilogy(continuous_epochs, continuous_train_infid, color='blue', label='Train Set', marker='o', markersize=3, linestyle='-')
+    plt.semilogy(continuous_epochs, continuous_test_infid, color='orange', label='Test Set', marker='x', markersize=3, linestyle='--')
+    plt.xlabel('Global Epoch', fontsize=12)
+    plt.ylabel('Mean Infidelity (1 - F)', fontsize=12)
+    plt.title('Continuous Shotgun Optimization (Train vs Test)', fontsize=14)
+    plt.grid(True, which="both", ls="--", alpha=0.5)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+    # Distribution of per-sample fidelities for the best model found.
+    plt.figure(figsize=(8, 5))
+    plt.hist(final_test_fidelities, bins=30, color='green', alpha=0.7, edgecolor='black')
+    plt.xlabel('Amplitude Fidelity', fontsize=12)
+    plt.ylabel('Frequency', fontsize=12)
+    plt.title(f'Best Test Fidelities Distribution (Mean: {np.mean(final_test_fidelities):.4f})', fontsize=14)
+    plt.grid(True, ls="--", alpha=0.5)
+    plt.tight_layout()
+    plt.show()
+
