@@ -1285,10 +1285,7 @@ if __name__ == "__main__":
         start_t = time.perf_counter()
         phases_target = processor.phases_from_U(u_target, plot_graph=True)
         currents_target = processor.currents_from_phases(phases_target)
-        print(
-            f"  Batch size: {batch_size}\n"
-            f"  U -> currents calculation in {time.perf_counter()-start_t:.3f} s"
-        )
+        print(f"  Batch size: {batch_size}\n" f"  U -> currents calculation in {time.perf_counter()-start_t:.3f} s")
 
         # 3 Experimental matrix retrieval
         phases_exp = processor.phases_from_currents(currents_target)

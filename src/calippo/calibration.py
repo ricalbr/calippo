@@ -41,6 +41,7 @@ class CalibrationModel(nn.Module):
     Wrapper to train the mesh parameters while strictly enforcing
     the physical constraints (masks) during the forward pass.
     """
+
     def __init__(self, mesh_instance):
         super().__init__()
         self.mesh = mesh_instance
@@ -52,7 +53,7 @@ class CalibrationModel(nn.Module):
         xt_active = self.mesh.xtalk * self.mesh.xtalk_mask
 
         # Phase model combining static offset and masked current-dependent cross-talk
-        I2 = currents ** 2
+        I2 = currents**2
         phases = sp_active + I2 @ xt_active.T
 
         # Native unitary propagation avoiding manual 2*pi wrapping to prevent gradient discontinuities.
@@ -60,8 +61,9 @@ class CalibrationModel(nn.Module):
         return torch.abs(U)
 
 
-def lr_finder(model, optimizer, criterion, I_train, U_target_train,
-              init_lr=1e-7, max_lr=10.0, steps=100, plot_result=False):
+def lr_finder(
+    model, optimizer, criterion, I_train, U_target_train, init_lr=1e-7, max_lr=10.0, steps=100, plot_result=False
+):
     """
     Classic LR range test: ramp the learning rate exponentially from
     `init_lr` to `max_lr` over `steps` optimizer steps, and pick the LR at
@@ -131,10 +133,18 @@ def lr_finder(model, optimizer, criterion, I_train, U_target_train,
     if plot_result:
         plt.figure(figsize=(8, 5))
         plt.plot(lrs, losses, label='Raw Loss', color='blue')
-        plt.scatter(optimal_lr, losses[steepest_idx], color='red', s=50, zorder=5,
-                    label=f'Optimal LR: {optimal_lr:.2e}')
-        plt.scatter(lrs[first_min_idx], losses[first_min_idx], color='orange', s=50, zorder=4,
-                    label='First Minimum (Noise Start)', marker='X')
+        plt.scatter(
+            optimal_lr, losses[steepest_idx], color='red', s=50, zorder=5, label=f'Optimal LR: {optimal_lr:.2e}'
+        )
+        plt.scatter(
+            lrs[first_min_idx],
+            losses[first_min_idx],
+            color='orange',
+            s=50,
+            zorder=4,
+            label='First Minimum (Noise Start)',
+            marker='X',
+        )
 
         plt.xscale('log')
         plt.xlabel('Learning Rate')
@@ -169,7 +179,6 @@ def load_data(
     current_2pi: float | None = None,
     mock_samples: int = 10_000,
 ):
-
     """Load experimental data from disk or synthesize mock data using a mesh model."""
     if load_external:
         if not data_filepath:
@@ -194,7 +203,6 @@ def load_data(
             phases_exp = gt_processor.phases_from_currents(I_exp)
             U_exp = gt_processor.U_from_phases(phases_exp)
 
-
     # Amplitude matrix
     U_mag_exp = torch.abs(U_exp)
 
@@ -212,6 +220,7 @@ def load_data(
     )
 
     return splits
+
 
 def reinitialize_processor_parameters(processor, current_2pi: float) -> None:
     """Reinitializes photonic processor static phases randomly in [0, 2π) and resets
@@ -292,7 +301,9 @@ def targeted_xtalk_escape(
 
             # Reset anomalous off-diagonal entries
             if has_bad_offdiag:
-                mesh.xtalk.data[bad_offdiag_mask_2d] = torch.sign(mesh.xtalk.data[bad_offdiag_mask_2d])* 0.10 * mean_diag
+                mesh.xtalk.data[bad_offdiag_mask_2d] = (
+                    torch.sign(mesh.xtalk.data[bad_offdiag_mask_2d]) * 0.10 * mean_diag
+                )
 
             # Reset anomalous diagonal entries & randomize static phases
             if has_bad_diag:
@@ -303,8 +314,11 @@ def targeted_xtalk_escape(
                 num_bad_sp = bad_sp_mask.sum().item()
 
                 if num_bad_sp > 0:
-                    mesh.static_phases.data[bad_sp_mask] = torch.rand(num_bad_sp,dtype=mesh.static_phases.dtype,device=mesh.static_phases.device)* 2* torch.pi
-
+                    mesh.static_phases.data[bad_sp_mask] = (
+                        torch.rand(num_bad_sp, dtype=mesh.static_phases.dtype, device=mesh.static_phases.device)
+                        * 2
+                        * torch.pi
+                    )
 
             # Reset optimizer state to purge outdated momentum/second moments
             epochs_no_improve = 0
@@ -382,17 +396,14 @@ def run_start_diagnostics(
     calib_model: torch.nn.Module,
     circular_abs_error,
     gt_processor: torch.nn.Module | None = None,
-    plot_per_start:bool = False,
+    plot_per_start: bool = False,
 ) -> None:
     """Logs parameter estimation diagnostics and plots errors or estimated maps.
     Evaluates both ground-truth comparison (if available) and experimental data
     parameter visualisations.
     """
     status_str = "Failed to reach target" if start_failed else "Successfully reached target"
-    print(
-        f"\n[DIAGNOSTICS] Start {start_idx + 1} {status_str} "
-        f"(Final Test Fid: {final_test_fid:.5f})."
-    )
+    print(f"\n[DIAGNOSTICS] Start {start_idx + 1} {status_str} " f"(Final Test Fid: {final_test_fid:.5f}).")
 
     with torch.inference_mode():
         mesh = calib_model.mesh  # type: ignore[attr-defined]
@@ -406,7 +417,7 @@ def run_start_diagnostics(
             gt_xt = (gt_processor.xtalk * gt_processor.xtalk_mask).cpu().numpy()
 
             sp_mask_np = gt_processor.static_phases_mask.cpu().numpy().astype(bool)
-            xt_mask_np = (gt_processor.xtalk_mask.cpu().numpy() > 0)
+            xt_mask_np = gt_processor.xtalk_mask.cpu().numpy() > 0
 
         sp_error = circular_abs_error(est_sp, gt_sp)
         xt_error = np.abs(est_xt - gt_xt)
@@ -439,9 +450,7 @@ def run_start_diagnostics(
             fig.colorbar(im0, ax=axes[0])
 
             axes[1].plot(gt_sp, label="GT Static Phases", marker="o", alpha=0.7)
-            axes[1].plot(
-                est_sp, label="Est Static Phases [0, 2pi]", marker="x", alpha=0.7
-            )
+            axes[1].plot(est_sp, label="Est Static Phases [0, 2pi]", marker="x", alpha=0.7)
             axes[1].set_title(f"Start {start_idx + 1}: Static Phases Comparison")
             axes[1].legend()
             axes[1].grid(True, linestyle=":", alpha=0.6)
@@ -451,18 +460,14 @@ def run_start_diagnostics(
 
     else:
         if plot_per_start:
-            print(
-                "Plotting estimated parameters (No Ground Truth available for experimental data)..."
-            )
+            print("Plotting estimated parameters (No Ground Truth available for experimental data)...")
 
             fig, axes = plt.subplots(1, 2, figsize=(12, 4))
             im0 = axes[0].imshow(est_xt, cmap="viridis", aspect="auto")
             axes[0].set_title(f"Start {start_idx + 1}: Estimated Cross-Talk Matrix")
             fig.colorbar(im0, ax=axes[0])
 
-            axes[1].plot(
-                est_sp, label="Est Static Phases [0, 2pi]", marker="x", color="orange"
-            )
+            axes[1].plot(est_sp, label="Est Static Phases [0, 2pi]", marker="x", color="orange")
             axes[1].set_title(f"Start {start_idx + 1}: Estimated Static Phases")
             axes[1].legend()
             axes[1].grid(True, linestyle=":", alpha=0.6)
@@ -481,30 +486,30 @@ if __name__ == "__main__":
 
     n = 6
     train_ratio = 0.8
-    current_2pi = 17 # mA
+    current_2pi = 17  # mA
 
     load_external_data = True
     data_filepath = "unitary_measurement_20260121_1.npy"
 
     # --- Multi-start configuration ---
-    num_starts = 10              # max number of independent random restarts
-    target_fidelity = 0.9985     # stop as soon as a start reaches this test fidelity
-    check_interval = 100         # epochs between test-set evaluations
-    max_global_epochs = 100_000    # hard cap on epochs summed across ALL starts
+    num_starts = 10  # max number of independent random restarts
+    target_fidelity = 0.9985  # stop as soon as a start reaches this test fidelity
+    check_interval = 100  # epochs between test-set evaluations
+    max_global_epochs = 100_000  # hard cap on epochs summed across ALL starts
 
     # --- Stagnation & targeted escape configuration ---
-    escape_patience = 200        # epochs with no raw-loss improvement before an escape is considered
-    max_escape_attempts = 5      # escapes allowed within a single start before giving up on it
-    min_loss_delta = 1e-6        # minimum absolute MSE improvement to NOT count as stagnation
+    escape_patience = 200  # epochs with no raw-loss improvement before an escape is considered
+    max_escape_attempts = 5  # escapes allowed within a single start before giving up on it
+    min_loss_delta = 1e-6  # minimum absolute MSE improvement to NOT count as stagnation
 
     # --- Diagnostics ---
-    plot_lr_finder = False      # Show LR-finder plot only on first start by default to avoid notebook clutter
-    plot_per_start = False      # Show per-start diagnostic plot
+    plot_lr_finder = False  # Show LR-finder plot only on first start by default to avoid notebook clutter
+    plot_per_start = False  # Show per-start diagnostic plot
 
     # --- Data Loading ---
     (I_train, I_test), (U_train, U_test), (U_mag_train, U_mag_test) = load_data(
         load_external=True,
-        data_filepath = data_filepath,
+        data_filepath=data_filepath,
         mesh_class=MeshClass,
         n_modes=n,
         current_2pi=current_2pi,
@@ -611,9 +616,7 @@ if __name__ == "__main__":
 
                 if mean_fid_test > best_overall_fidelity:
                     best_overall_fidelity = mean_fid_test
-                    best_model_weights = {
-                        k: v.clone() for k, v in calib_model.state_dict().items()
-                    }
+                    best_model_weights = {k: v.clone() for k, v in calib_model.state_dict().items()}
 
                 if mean_fid_test >= target_fidelity:
                     print(f"Target testing fidelity reached at Global Epoch {global_epoch}!")
@@ -648,11 +651,7 @@ if __name__ == "__main__":
         )
 
         # --- TERMINATION CHECK ---
-        if (
-            interrupted
-            or best_overall_fidelity >= target_fidelity
-            or global_epoch >= max_global_epochs
-        ):
+        if interrupted or best_overall_fidelity >= target_fidelity or global_epoch >= max_global_epochs:
             if best_overall_fidelity >= target_fidelity:
                 print("\nGlobal target fidelity achieved! Terminating multi-start search early.")
             break
@@ -670,8 +669,10 @@ if __name__ == "__main__":
         # start): there is no tracked "best" checkpoint yet, so fall back
         # to whatever the model currently holds rather than crashing on
         # `load_state_dict(None)`.
-        print("No checkpoint was recorded yet (interrupted very early) -- "
-                "evaluating the current, largely untrained model instead.")
+        print(
+            "No checkpoint was recorded yet (interrupted very early) -- "
+            "evaluating the current, largely untrained model instead."
+        )
 
     calib_model.eval()
 
@@ -681,8 +682,24 @@ if __name__ == "__main__":
 
     # Full training history across ALL starts on one timeline.
     plt.figure(figsize=(9, 5))
-    plt.semilogy(continuous_epochs, continuous_train_infid, color='blue', label='Train Set', marker='o', markersize=3, linestyle='-')
-    plt.semilogy(continuous_epochs, continuous_test_infid, color='orange', label='Test Set', marker='x', markersize=3, linestyle='--')
+    plt.semilogy(
+        continuous_epochs,
+        continuous_train_infid,
+        color='blue',
+        label='Train Set',
+        marker='o',
+        markersize=3,
+        linestyle='-',
+    )
+    plt.semilogy(
+        continuous_epochs,
+        continuous_test_infid,
+        color='orange',
+        label='Test Set',
+        marker='x',
+        markersize=3,
+        linestyle='--',
+    )
     plt.xlabel('Global Epoch', fontsize=12)
     plt.ylabel('Mean Infidelity (1 - F)', fontsize=12)
     plt.title('Continuous Shotgun Optimization (Train vs Test)', fontsize=14)
@@ -700,4 +717,3 @@ if __name__ == "__main__":
     plt.grid(True, ls="--", alpha=0.5)
     plt.tight_layout()
     plt.show()
-
