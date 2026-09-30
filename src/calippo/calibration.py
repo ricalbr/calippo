@@ -7,25 +7,19 @@ Created on Mon Sep 21 13:57:51 2026
 
 Multi-start calibration of a UPP mesh (Bell/Clements) via gradient descent
 on the amplitude-only forward model, with a targeted "cross-talk escape"
-mechanism to recover from stagnation.
+mechanism to recover from stagnation and curriculum learning for the 
+non-linear thermal phase components.
 
 Design summary
 ---------------
 1. MULTI-START: each start reinitializes the mesh with random static
-   phases and re-runs the automatic LR finder, so different starts explore
-   different basins of the (non-convex) phase-retrieval landscape.
-2. STAGNATION DETECTION: per-epoch, based on the absolute improvement of
-   the raw training MSE loss (not a relative delta), so it isn't fooled by
-   the LR shrinking over time via the scheduler.
-3. TARGETED ESCAPE (not a blind random kick): when training stagnates, the
-   cross-talk matrix is inspected for statistically anomalous diagonal
-   (self heater-efficiency) or off-diagonal (cross-heater coupling)
-   entries. Only those specific entries -- and their associated static
-   phases -- are reset, while the rest of the fit is preserved. If no
-   anomaly explains the stagnation, the start is abandoned in favor of a
-   fresh one, since the current basin is assumed to be exhausted.
-4. The best model (by test amplitude fidelity) across all starts and all
-   escape attempts is kept and reloaded at the end.
+   phases and re-runs the automatic LR finder.
+2. STAGNATION DETECTION: per-epoch, based on absolute improvement of raw MSE.
+3. TARGETED ESCAPE: specific resets on anomalous cross-talk matrix entries.
+4. CURRICULUM LEARNING (NON-LINEAR): The non-linear thermal factor (nl_factor)
+   is initially frozen to 0 to allow the optimizer to find the correct general
+   basin. Once test fidelity hits 0.99, it is unfrozen and jointly optimized 
+   to reach the final precision target.
 """
 
 import torch
@@ -57,15 +51,19 @@ class CalibrationModel(nn.Module):
         xt_active = self.mesh.xtalk * self.mesh.xtalk_mask
 
         # 2. Phase model: static phase + current-dependent cross-talk
-        #    contribution (mimics phases_from_currents, but masked).
+        #    contribution with optional non-linear conditioning.
         I2 = currents ** 2
-        phases = sp_active + I2 @ xt_active.T
+        
+        if self.mesh.nonlinear:
+            # Active non-linear factors
+            nl_active = self.mesh.nl_factor * self.mesh.static_phases_mask
+            I2_eff = I2 * (1 + nl_active * I2)
+        else:
+            I2_eff = I2
+            
+        phases = sp_active + I2_eff @ xt_active.T
 
-        # 3. Native unitary propagation. No explicit "% 2*pi" here: U_from_phases
-        #    is itself 2*pi-periodic (it only ever consumes phases through
-        #    sin/cos), so wrapping manually would only introduce a spurious
-        #    gradient discontinuity every time a phase crosses a 2*pi boundary
-        #    without changing the physics.
+        # 3. Native unitary propagation.
         U = self.mesh.U_from_phases(phases)
         return torch.abs(U)
 
@@ -187,23 +185,19 @@ if __name__ == "__main__":
         current_2pi = 16
 
         load_external_data = True
-        data_filepath = "unitary_measurement_20260121_1.npy"
+        data_filepath = "../../data/unitary_measurement_20260121_1.npy"
 
         # --- Multi-start configuration ---
-        num_starts = 10              # max number of independent random restarts
-        target_fidelity = 0.9985     # stop as soon as a start reaches this test fidelity
-        check_interval = 100         # epochs between test-set evaluations
-        max_global_epochs = 100000    # hard cap on epochs summed across ALL starts
+        num_starts = 10
+        target_fidelity = 0.9995
+        check_interval = 100
+        max_global_epochs = 1000000
 
         # --- Stagnation & targeted escape configuration ---
-        escape_patience = 200        # epochs with no raw-loss improvement before an escape is considered
-        max_escape_attempts = 5      # escapes allowed within a single start before giving up on it
-        min_loss_delta = 1e-6        # minimum absolute MSE improvement to NOT count as stagnation
+        escape_patience = 200
+        max_escape_attempts = 5
+        min_loss_delta = 1e-6
 
-        # Diagnostics-only knob: the LR-finder plot is informative but
-        # produces one figure per start. Default to showing it only once
-        # (first start) to avoid flooding the notebook with 10 near-identical
-        # plots; set to True to see it for every start.
         plot_lr_finder_every_start = True
 
         # ==========================================
@@ -211,7 +205,6 @@ if __name__ == "__main__":
         # ==========================================
         if load_external_data:
             print(f"Loading external experimental data from {data_filepath}...")
-
             with open(data_filepath, 'rb') as f:
                 u_th = np.load(f)
                 U_np_reshaped = np.load(f)
@@ -223,9 +216,7 @@ if __name__ == "__main__":
 
             from calippo.tools import sinkhorn
             
-
             I_exp = torch.tensor(currents, dtype=torch.float32)
-            # U_np_reshaped = loaded_data['Us'].reshape(loaded_data['Us'].shape[0], n, n)
             U_exp = torch.tensor(U_np_reshaped, dtype=torch.complex128)
             U_exp = torch.sqrt(sinkhorn(U_exp)[0])
             U_mag_exp = torch.abs(U_exp)
@@ -239,10 +230,8 @@ if __name__ == "__main__":
             n_train = int(total_samples * train_ratio)
             n_test = total_samples - n_train
 
-            # Ground-truth processor used only to synthesize data; kept around
-            # afterwards so the diagnostics section below can compare the
-            # fitted parameters against the true ones.
-            gt_processor = MeshClass(n_modes=n)
+            # Generiamo GT con non-linearità abilitata per testare l'efficacia del learning
+            gt_processor = MeshClass(n_modes=n, nonlinear=True)
             I_exp = gt_processor.generate_random_currents(current_ampl=current_2pi, batch_size=total_samples)
             with torch.no_grad():
                 phases_exp = gt_processor.phases_from_currents(I_exp)
@@ -260,19 +249,15 @@ if __name__ == "__main__":
         # ==========================================
         best_overall_fidelity = -1.0
         best_model_weights = None
-        interrupted = False  # set to True on a user-requested Ctrl+C stop
+        interrupted = False
 
-        # Epoch counter and loss-history lists are shared across ALL starts,
-        # so the final convergence plot shows one continuous timeline rather
-        # than restarting from zero at each start.
         global_epoch = 0
         continuous_epochs = []
         continuous_train_infid = []
         continuous_test_infid = []
 
-        # The mesh/model are created once and reused across starts; each
-        # start just reinitializes their parameters in-place (see below).
-        processor = MeshClass(n_modes=n)
+        # Mesh inizializzata CON modello non-lineare attivo
+        processor = MeshClass(n_modes=n, nonlinear=True)
         calib_model = CalibrationModel(processor)
 
         criterion = nn.MSELoss()
@@ -283,13 +268,9 @@ if __name__ == "__main__":
 
             print(f" START {start_idx + 1}/{num_starts} ".center(75, '='))
 
+            nl_unfrozen = False # Flag per il curriculum learning
+
             # --- Random reinitialization for this start ---
-            # Static phases: uniform random in [0, 2*pi) (unlike a single
-            # fixed "in the dark" init, this is what actually gives the
-            # multi-start its diversity of basins to explore).
-            # Cross-talk: reset to the ideal (diagonal-only) coupling,
-            # scaled so that a current of `current_2pi` produces a 2*pi
-            # phase shift on its own heater.
             with torch.no_grad():
                 random_phases = torch.rand(processor.n_phases, dtype=processor.static_phases.dtype) * 2 * torch.pi
                 processor.static_phases.copy_(random_phases)
@@ -300,6 +281,12 @@ if __name__ == "__main__":
                 processor.static_phases.mul_(processor.static_phases_mask)
                 processor.xtalk.mul_(processor.xtalk_mask)
 
+                # Resetta e congela il fattore non-lineare all'inizio
+                if processor.nonlinear:
+                    processor.nl_factor.zero_()
+                    processor.nl_factor.requires_grad = False
+
+            # L'ottimizzatore prende tutti i parametri, ma ignorerà nl_factor (perché requires_grad=False)
             optimizer = optim.Adam(calib_model.parameters(), lr=1e-7)
 
             print("Running automated LR finder...")
@@ -316,15 +303,15 @@ if __name__ == "__main__":
                 print("\n[INTERRUPTED] Ctrl+C received during LR finder. Stopping the search.")
                 interrupted = True
                 break
+            
             optimizer.param_groups[0]['lr'] = optimal_lr
-
-            scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=50)
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=200)
 
             best_loss_this_start = float('inf')
             epochs_no_improve = 0
             escape_attempts = 0
             final_test_fid = 0.0
-            start_failed = True  # optimistic default flipped to False only on target reached
+            start_failed = True
 
             print(f"Starting training (Target Fidelity: {target_fidelity})...")
 
@@ -354,7 +341,7 @@ if __name__ == "__main__":
                     scheduler.step(loss_train.detach())
                 except KeyboardInterrupt:
                     print(f"\n[INTERRUPTED] Ctrl+C received at Global Epoch {global_epoch}. "
-                          f"Stopping training and moving to final evaluation with the best model found so far.")
+                          f"Stopping training and moving to final evaluation.")
                     interrupted = True
                     break
 
@@ -375,7 +362,6 @@ if __name__ == "__main__":
                     calib_model.eval()
                     with torch.no_grad():
                         U_mag_pred_test = calib_model(I_test)
-
                         mean_fid_train = amplitude_fidelity(U_train, U_mag_pred_train).mean().item()
                         mean_fid_test = amplitude_fidelity(U_test, U_mag_pred_test).mean().item()
 
@@ -401,6 +387,14 @@ if __name__ == "__main__":
                         start_failed = False
                         break
 
+                    # ----------------------------------------------------------
+                    # CURRICULUM LEARNING: SCONGELAMENTO FATTORE NON-LINEARE
+                    # ----------------------------------------------------------
+                    if processor.nonlinear and mean_fid_test > 0.99 and not nl_unfrozen:
+                        print(f"\n[PHASE 2] Test Fidelity > 0.99 reached! Unfreezing 'nl_factor' for non-linear optimization.")
+                        processor.nl_factor.requires_grad = True
+                        nl_unfrozen = True
+
                 # ----------------------------------------------------------
                 # TARGETED CROSS-TALK ESCAPE
                 # ----------------------------------------------------------
@@ -412,93 +406,69 @@ if __name__ == "__main__":
                 # estimate is often compensated by an equally-wrong static
                 # phase, and the two need to be broken out of that joint
                 # local minimum together.
-                if epochs_no_improve >= escape_patience:
-                    if escape_attempts < max_escape_attempts:
-                        with torch.no_grad():
-                            mesh = calib_model.mesh
-                            xt_active = mesh.xtalk * mesh.xtalk_mask
-                            n_p = xt_active.shape[0]
+                # if epochs_no_improve >= escape_patience:
+                #     if escape_attempts < max_escape_attempts:
+                #         with torch.no_grad():
+                #             mesh = calib_model.mesh
+                #             xt_active = mesh.xtalk * mesh.xtalk_mask
+                #             n_p = xt_active.shape[0]
 
-                            # 1. Diagonal anomalies (self heater-efficiency)
-                            diag_idx = torch.arange(n_p, device=mesh.xtalk.device)
-                            diag = xt_active[diag_idx, diag_idx]
-                            diag_mask = mesh.xtalk_mask[diag_idx, diag_idx].bool()
+                #             diag_idx = torch.arange(n_p, device=mesh.xtalk.device)
+                #             diag = xt_active[diag_idx, diag_idx]
+                #             diag_mask = mesh.xtalk_mask[diag_idx, diag_idx].bool()
 
-                            valid_diag = diag[diag_mask]
-                            if len(valid_diag) > 0:
-                                mean_diag = valid_diag.abs().mean().clamp_min(1e-8)
-                            else:
-                                mean_diag = torch.tensor(1e-8, device=diag.device)
+                #             valid_diag = diag[diag_mask]
+                #             if len(valid_diag) > 0:
+                #                 mean_diag = valid_diag.abs().mean().clamp_min(1e-8)
+                #             else:
+                #                 mean_diag = torch.tensor(1e-8, device=diag.device)
 
-                            # Flag diagonal entries that deviate from the mean
-                            # self-efficiency by more than 50%.
-                            diag_deviation = (diag.abs() - mean_diag).abs() / mean_diag
-                            bad_diag_mask = (diag_deviation > 0.50) & diag_mask
+                #             diag_deviation = (diag.abs() - mean_diag).abs() / mean_diag
+                #             bad_diag_mask = (diag_deviation > 0.50) & diag_mask
 
-                            # 2. Off-diagonal anomalies (cross-heater coupling)
-                            offdiag_mask = (mesh.xtalk_mask.bool() & (~torch.eye(n_p, dtype=torch.bool, device=mesh.xtalk.device)))
-                            offdiag_ratio_2d = mesh.xtalk.abs() / mean_diag
+                #             offdiag_mask = (mesh.xtalk_mask.bool() & (~torch.eye(n_p, dtype=torch.bool, device=mesh.xtalk.device)))
+                #             offdiag_ratio_2d = mesh.xtalk.abs() / mean_diag
+                #             bad_offdiag_mask_2d = offdiag_mask & (offdiag_ratio_2d > 0.30)
 
-                            # Flag off-diagonal entries exceeding 30% of the
-                            # mean diagonal magnitude (implausibly strong
-                            # cross-talk for a well-behaved mesh).
-                            bad_offdiag_mask_2d = offdiag_mask & (offdiag_ratio_2d > 0.30)
+                #             has_bad_diag = bad_diag_mask.any()
+                #             has_bad_offdiag = bad_offdiag_mask_2d.any()
 
-                            has_bad_diag = bad_diag_mask.any()
-                            has_bad_offdiag = bad_offdiag_mask_2d.any()
+                #             if has_bad_diag or has_bad_offdiag:
+                #                 escape_attempts += 1
 
-                            if has_bad_diag or has_bad_offdiag:
-                                escape_attempts += 1
+                #                 if has_bad_offdiag:
+                #                     target_offdiag = 0.10 * mean_diag
+                #                     mesh.xtalk.data[bad_offdiag_mask_2d] = torch.sign(mesh.xtalk.data[bad_offdiag_mask_2d]) * target_offdiag
 
-                                # Reset anomalous off-diagonal entries to a
-                                # small, physically-plausible coupling
-                                # (10% of the mean diagonal), preserving sign.
-                                if has_bad_offdiag:
-                                    target_offdiag = 0.10 * mean_diag
-                                    mesh.xtalk.data[bad_offdiag_mask_2d] = torch.sign(mesh.xtalk.data[bad_offdiag_mask_2d]) * target_offdiag
+                #                 if has_bad_diag:
+                #                     bad_diag_indices = diag_idx[bad_diag_mask]
+                #                     target_diag = mean_diag
 
-                                # Reset anomalous diagonal entries to the mean
-                                # self-efficiency, and randomize the static
-                                # phase of the corresponding heater to break
-                                # the joint (efficiency, phase) local minimum.
-                                if has_bad_diag:
-                                    bad_diag_indices = diag_idx[bad_diag_mask]
-                                    target_diag = mean_diag
+                #                     mesh.xtalk.data[bad_diag_indices, bad_diag_indices] = torch.sign(mesh.xtalk.data[bad_diag_indices, bad_diag_indices]) * target_diag
 
-                                    mesh.xtalk.data[bad_diag_indices, bad_diag_indices] = torch.sign(mesh.xtalk.data[bad_diag_indices, bad_diag_indices]) * target_diag
+                #                     bad_sp_mask = bad_diag_mask & mesh.static_phases_mask.bool()
+                #                     bad_sp_indices = diag_idx[bad_sp_mask]
 
-                                    bad_sp_mask = bad_diag_mask & mesh.static_phases_mask.bool()
-                                    bad_sp_indices = diag_idx[bad_sp_mask]
+                #                     if len(bad_sp_indices) > 0:
+                #                         random_phases = torch.rand(len(bad_sp_indices), dtype=mesh.static_phases.dtype, device=mesh.static_phases.device) * 2 * torch.pi
+                #                         mesh.static_phases.data[bad_sp_indices] = random_phases
 
-                                    if len(bad_sp_indices) > 0:
-                                        random_phases = torch.rand(len(bad_sp_indices), dtype=mesh.static_phases.dtype, device=mesh.static_phases.device) * 2 * torch.pi
-                                        mesh.static_phases.data[bad_sp_indices] = random_phases
+                #                 optimizer.state.clear()
+                #                 epochs_no_improve = 0
+                #                 optimizer.param_groups[0]['lr'] = optimal_lr
+                #                 scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.9, patience=100)
 
-                                # Reset Adam's momentum/second-moment state:
-                                # after a targeted parameter reset, the old
-                                # statistics no longer describe the local
-                                # curvature and would misdirect the first few
-                                # post-escape steps.
-                                optimizer.state.clear()
-                                epochs_no_improve = 0
-                                optimizer.param_groups[0]['lr'] = optimal_lr
-                                scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.9, patience=100)
+                #                 num_bad_diag = bad_diag_mask.sum().item()
+                #                 num_bad_offdiag = bad_offdiag_mask_2d.sum().item()
 
-                                num_bad_diag = bad_diag_mask.sum().item()
-                                num_bad_offdiag = bad_offdiag_mask_2d.sum().item()
-
-                                print(f"\n[TARGETED XTALK ESCAPE] Reset {num_bad_diag} diagonal (with static phases) and {num_bad_offdiag} off-diagonal "
-                                      f"anomalous active coefficients (Attempt {escape_attempts}/{max_escape_attempts}).")
-                            else:
-                                # Stagnation isn't explained by an anomalous
-                                # cross-talk entry -- the basin is assumed
-                                # exhausted, so move on to a fresh start
-                                # rather than keep grinding on it.
-                                print(f"\nLoss stagnated for {escape_patience} epochs, but no anomalous xtalk found. Triggering next start...")
-                                break
-                    else:
-                        print(f"\nMax escape attempts ({max_escape_attempts}) reached. Triggering next start...")
-                        break
+                #                 print(f"\n[TARGETED XTALK ESCAPE] Reset {num_bad_diag} diagonal (with static phases) and {num_bad_offdiag} off-diagonal "
+                #                       f"anomalous active coefficients (Attempt {escape_attempts}/{max_escape_attempts}).")
+                #             else:
+                #                 print(f"\nLoss stagnated for {escape_patience} epochs, but no anomalous xtalk found. Triggering next start...")
+                #                 break
+                #     else:
+                #         print(f"\nMax escape attempts ({max_escape_attempts}) reached. Triggering next start...")
+                #         break
 
             # ==========================================
             # PER-START DIAGNOSTICS
@@ -512,6 +482,8 @@ if __name__ == "__main__":
             with torch.no_grad():
                 est_sp = np.mod((calib_model.mesh.static_phases * calib_model.mesh.static_phases_mask).cpu().numpy(), 2 * np.pi)
                 est_xt = (calib_model.mesh.xtalk * calib_model.mesh.xtalk_mask).cpu().numpy()
+                if calib_model.mesh.nonlinear:
+                    est_nl = (calib_model.mesh.nl_factor * calib_model.mesh.static_phases_mask).cpu().numpy()
 
             if gt_processor is not None:
                 # Mock data: ground truth is available, so report fit errors.
@@ -519,6 +491,8 @@ if __name__ == "__main__":
                 with torch.no_grad():
                     gt_sp = np.mod((gt_processor.static_phases * gt_processor.static_phases_mask).cpu().numpy(), 2 * np.pi)
                     gt_xt = (gt_processor.xtalk * gt_processor.xtalk_mask).cpu().numpy()
+                    if gt_processor.nonlinear:
+                        gt_nl = (gt_processor.nl_factor * gt_processor.static_phases_mask).cpu().numpy()
 
                 # Static phases are circular quantities: use the wrap-around
                 # aware distance so that e.g. 0.01 rad vs 6.27 rad is
@@ -529,6 +503,10 @@ if __name__ == "__main__":
 
                 print(f"  -> Static Phases [0, 2pi] - Max Circular Error: {np.max(sp_error):.4e} | Mean Error: {np.mean(sp_error[gt_processor.static_phases_mask.cpu().numpy()]):.4e}")
                 print(f"  -> Cross-Talk Matrix - Max Absolute Error: {np.max(xt_error):.4e} | Mean Error: {np.mean(xt_error[gt_processor.xtalk_mask.cpu().numpy() > 0]):.4e}")
+
+                if gt_processor.nonlinear:
+                    nl_error = np.abs(est_nl - gt_nl)
+                    print(f"  -> Non-Linear Factor - Max Absolute Error: {np.max(nl_error):.4e} | Mean Error: {np.mean(nl_error[gt_processor.static_phases_mask.cpu().numpy()]):.4e}")
 
                 worst_sp_idx = np.argmax(sp_error)
                 print(f"  -> Worst Static Phase index: {worst_sp_idx} (Est: {est_sp[worst_sp_idx]:.4f}, GT: {gt_sp[worst_sp_idx]:.4f})")
@@ -546,7 +524,6 @@ if __name__ == "__main__":
                 axes[1].set_title(f"Start {start_idx + 1}: Static Phases Comparison")
                 axes[1].legend()
                 axes[1].grid(True, linestyle=":", alpha=0.6)
-
                 plt.tight_layout()
                 plt.show()
 
@@ -563,7 +540,6 @@ if __name__ == "__main__":
                 axes[1].set_title(f"Start {start_idx + 1}: Estimated Static Phases")
                 axes[1].legend()
                 axes[1].grid(True, linestyle=":", alpha=0.6)
-
                 plt.tight_layout()
                 plt.show()
 
