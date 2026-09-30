@@ -55,10 +55,16 @@ class Mesh(nn.Module, ABC):
     calibration_file : str, optional
         Path to a pickle file containing the hardware calibration data.
         If None, a random calibration is generated.
+    nonlinear : bool, optional
+        If True, a non-linear relation between phases and currents is applied:
+        phases = static_phases + xtalk @ (I^2 * (1 + nl_factor * I^2)).
+        Default is False (purely quadratic relation).
     """
 
-    def __init__(self, n_modes: int, calibration_file: str | None = None) -> None:
+    def __init__(self, n_modes: int, calibration_file: str | None = None, nonlinear: bool = False) -> None:
         super().__init__()
+
+        self.nonlinear = nonlinear
 
         if n_modes % 2 != 0:
             n_modes -= 1
@@ -80,21 +86,23 @@ class Mesh(nn.Module, ABC):
         # Mode mixing implemented by directional couplers layers
         self.register_buffer("M", torch.from_numpy(M_np).to(torch.complex128))
 
-        # This part populates xtalk (rad/mA2) and static phases (rad)
+        # This part populates xtalk (rad/mA2), static phases (rad) and nl_factor (rad/mA4)
         if calibration_file is not None:
-            sp_np, xt_np = self.import_calibration(calibration_file)
+            sp_np, xt_np, nl_np = self.import_calibration(calibration_file)
         else:
-            sp_np, xt_np = self.generate_random_calibration(1.0, 2 * np.pi)
+            sp_np, xt_np, nl_np = self.generate_random_calibration(1.0, 2 * np.pi)
 
         # Register as Parameters to enable training (e.g., with Adam)
         self.static_phases = nn.Parameter(torch.from_numpy(sp_np).float())
         self.xtalk = nn.Parameter(torch.from_numpy(xt_np).float())
+        self.nl_factor = nn.Parameter(torch.from_numpy(nl_np).float())
 
         # Output
         msg = (
             "A new processor was created.\n"
             + f"This has {self.n_modes} modes, {self.n_phases} tunable phases.\n"
-            + f"Only {self.n_used_phases} phases are actually used.\n",
+            + f"Only {self.n_used_phases} phases are actually used.\n"
+            + f"Non-linear model: {'Enabled' if self.nonlinear else 'Disabled'}\n",
         )
         print(*msg)
 
@@ -106,7 +114,7 @@ class Mesh(nn.Module, ABC):
     def _generate_mixing_layers(self) -> tuple[int, nparray]:
         pass
 
-    def import_calibration(self, fileName: str) -> tuple[nparray, nparray]:
+    def import_calibration(self, fileName: str) -> tuple[nparray, nparray, nparray]:
         """
         Import calibration data from a pickle file.
 
@@ -114,12 +122,13 @@ class Mesh(nn.Module, ABC):
         ----------
         fileName : str
             Path to the pickle file containing 'static_phases',
-            'xt_matrix', and 'n_heaters'.
+            'xt_matrix', 'n_heaters', and optionally 'nl_factor'.
 
         Returns
         -------
         tuple of np.ndarray
-            The static phases array (rad) and the cross-talk matrix (rad/mA2).
+            The static phases array (rad), the cross-talk matrix (rad/mA2),
+            and the non-linear factor (rad/mA4) array.
 
         Raises
         ------
@@ -146,14 +155,22 @@ class Mesh(nn.Module, ABC):
         xtalk = calibration["xt_matrix"]
         xtalk = xtalk * self.xtalk_mask.cpu().numpy()
 
-        return static_phases, xtalk
+        # Extract or set nl_factor
+        if self.nonlinear:
+            if "nl_factor" not in calibration:
+                raise KeyError("Non-linear model enabled, but 'nl_factor' not found in calibration file.")
+            nl_factor = calibration["nl_factor"] * self.static_phases_mask.cpu().numpy()
+        else:
+            nl_factor = np.zeros(self.n_phases)
+
+        return static_phases, xtalk, nl_factor
 
     def generate_random_calibration(
         self,
         xtalk_ampl: float,
         static_phases_ampl: float,
         noise: float | None = None,
-    ) -> tuple[nparray, nparray]:
+    ) -> tuple[nparray, nparray, nparray]:
         """
         Generate a random calibration (static phases and cross-talk) for
         simulation purposes.
@@ -170,7 +187,8 @@ class Mesh(nn.Module, ABC):
         Returns
         -------
         tuple of np.ndarray
-            An array of static phases (rad) and the cross-talk matrix (rad/mA2).
+            An array of static phases (rad), the cross-talk matrix (rad/mA2),
+            and the non-linear factor (rad/mA4) array.
         """
         # Set noise level
         if noise is None:
@@ -185,7 +203,14 @@ class Mesh(nn.Module, ABC):
         xtalk = np.eye(self.n_phases) * xtalk_ampl + (np.random.rand(self.n_phases, self.n_phases) - 0.5) * noise
         xtalk = xtalk * xt_mask_np
 
-        return static_phases, xtalk
+        # Generate non-linear factor based on noise
+        if self.nonlinear:
+            nl_factor = np.full(self.n_phases, noise / (2 * np.pi))
+            nl_factor = nl_factor * sp_mask_np
+        else:
+            nl_factor = np.zeros(self.n_phases)
+
+        return static_phases, xtalk, nl_factor
 
     def generate_random_currents(self, current_ampl: float, batch_size: int | None = None) -> torch.Tensor:
         """
@@ -216,7 +241,8 @@ class Mesh(nn.Module, ABC):
     def phases_from_currents(self, currents: torch.Tensor) -> torch.Tensor:
         """
         Calculate the optical phases for currents based on the cross-talk
-        coefficients. Supports batches (B, n_phases) or single (n_phases,).
+        coefficients and non-linear factors. Supports batches (B, n_phases) 
+        or single (n_phases,).
 
         Parameters
         ----------
@@ -249,9 +275,15 @@ class Mesh(nn.Module, ABC):
         static_phases = self.static_phases.to(currents.dtype)
         xtalk = self.xtalk.to(currents.dtype)
 
+        I2 = currents**2
+
+        # Apply effective squared current conditioning based on nonlinear flag
+        nl_factor = self.nl_factor.to(currents.dtype)
+        I2_eff = I2 * (1 + nl_factor * I2)
+
         # Calculate phases (Gradient support): (B, P) @ (P, P).T -> (B, P)
         # Now both are guaranteed to be the same precision
-        phases = static_phases + (currents**2) @ xtalk.T
+        phases = static_phases + I2_eff @ xtalk.T
 
         # Keep 2*pi in the same dtype to prevent unexpected promotion
         pi_tensor = torch.tensor(2 * torch.pi, dtype=currents.dtype, device=currents.device)
@@ -266,7 +298,7 @@ class Mesh(nn.Module, ABC):
     def currents_from_phases(self, phases: torch.Tensor) -> torch.Tensor:
         """
         Calculate the currents in mA required to achieve target optical phases,
-        compensating for cross-talk using the calibration matrix.
+        compensating for cross-talk and non-linear calibration.
         Supports single or batch processing.
 
         Parameters
@@ -310,20 +342,28 @@ class Mesh(nn.Module, ABC):
         xtalk = self.xtalk[used_rows][:, used_rows].to(phases.dtype)
 
         # Numerical inversion.
-        # The equation is: xtalk @ I2^T = (phases_used - static_phases)^T
+        # The equation is: xtalk @ I2_eff^T = (phases_used - static_phases)^T
         # We transpose to align the batch axis (B) as the last dimension
         target_diff = (phases_used - static_phases).T
-        I2 = torch.linalg.solve(xtalk, target_diff)
+        I2_eff = torch.linalg.solve(xtalk, target_diff)
 
         # Keep 2*pi in the same dtype
         pi_tensor = torch.tensor(2 * torch.pi, dtype=phases.dtype, device=phases.device)
 
-        while torch.any(I2 < 0):
-            target_diff[I2 < 0] += pi_tensor
-            I2 = torch.linalg.solve(xtalk, target_diff)
+        while torch.any(I2_eff < 0):
+            target_diff[I2_eff < 0] += pi_tensor
+            I2_eff = torch.linalg.solve(xtalk, target_diff)
 
         # Transpose back and reconstruct original dimensions
-        I2 = I2.T
+        I2_eff = I2_eff.T
+
+        # Closed-form inversion of the non-linear relation assuming nl_factor > 0
+        if self.nonlinear:
+            nl_factor = self.nl_factor[self.static_phases_mask].to(phases.dtype)
+            # Valid root and safe denominator due to nl_factor > 0
+            I2 = (-1 + torch.sqrt(1 + 4 * nl_factor * I2_eff)) / (2 * nl_factor)
+        else:
+            I2 = I2_eff
 
         # Inherit the dtype directly from phases
         I = torch.zeros_like(phases)
@@ -1274,8 +1314,11 @@ if __name__ == "__main__":
         n = 24
         batch_size = 1000
         processor = Clements(n_modes=n)
+        
+        # Initialize the processor activating the non-linear model
+        processor = Clements(n_modes=n, nonlinear=True)
 
-        print(f" Batch Decomposition ".center(45, '-'))
+        print(" Batch Decomposition ".center(45, '-'))
 
         # Generate a batch of Haar random unitaries (and make them "real-bordered")
         u_target_raw = get_haar_unitary(n, batch_size)
@@ -1314,4 +1357,9 @@ if __name__ == "__main__":
         print("-" * 45)
 
     except Exception as e:
+        print(f"{e}")
         traceback.print_exc()
+
+    finally:
+        if processor is not None:
+            pass
