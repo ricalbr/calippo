@@ -2,25 +2,19 @@
 """
 Multi-start calibration of a UPP mesh (Bell/Clements) via gradient descent
 on the amplitude-only forward model, with a targeted "cross-talk escape"
-mechanism to recover from stagnation.
+mechanism to recover from stagnation and curriculum learning for the 
+non-linear thermal phase components.
 
 Design summary
 ---------------
 1. MULTI-START: each start reinitializes the mesh with random static
-   phases and re-runs the automatic LR finder, so different starts explore
-   different basins of the (non-convex) phase-retrieval landscape.
-2. STAGNATION DETECTION: per-epoch, based on the absolute improvement of
-   the raw training MSE loss (not a relative delta), so it isn't fooled by
-   the LR shrinking over time via the scheduler.
-3. TARGETED ESCAPE (not a blind random kick): when training stagnates, the
-   cross-talk matrix is inspected for statistically anomalous diagonal
-   (self heater-efficiency) or off-diagonal (cross-heater coupling)
-   entries. Only those specific entries -- and their associated static
-   phases -- are reset, while the rest of the fit is preserved. If no
-   anomaly explains the stagnation, the start is abandoned in favor of a
-   fresh one, since the current basin is assumed to be exhausted.
-4. The best model (by test amplitude fidelity) across all starts and all
-   escape attempts is kept and reloaded at the end.
+   phases and re-runs the automatic LR finder.
+2. STAGNATION DETECTION: per-epoch, based on absolute improvement of raw MSE.
+3. TARGETED ESCAPE: specific resets on anomalous cross-talk matrix entries.
+4. CURRICULUM LEARNING (NON-LINEAR): The non-linear thermal factor (nl_factor)
+   is initially frozen to 0 to allow the optimizer to find the correct general
+   basin. Once test fidelity hits 0.99, it is unfrozen and jointly optimized 
+   to reach the final precision target.
 """
 
 import torch
@@ -52,11 +46,20 @@ class CalibrationModel(nn.Module):
         sp_active = self.mesh.static_phases * self.mesh.static_phases_mask
         xt_active = self.mesh.xtalk * self.mesh.xtalk_mask
 
-        # Phase model combining static offset and masked current-dependent cross-talk
-        I2 = currents**2
-        phases = sp_active + I2 @ xt_active.T
+        # 2. Phase model: static phase + current-dependent cross-talk
+        #    contribution with optional non-linear conditioning.
+        I2 = currents ** 2
+        
+        if self.mesh.nonlinear:
+            # Active non-linear factors
+            nl_active = self.mesh.nl_factor * self.mesh.static_phases_mask
+            I2_eff = I2 * (1 + nl_active * I2)
+        else:
+            I2_eff = I2
+            
+        phases = sp_active + I2_eff @ xt_active.T
 
-        # Native unitary propagation avoiding manual 2*pi wrapping to prevent gradient discontinuities.
+        # 3. Native unitary propagation.
         U = self.mesh.U_from_phases(phases)
         return torch.abs(U)
 
@@ -243,6 +246,10 @@ def reinitialize_processor_parameters(processor, current_2pi: float) -> None:
         # Mask the output
         processor.static_phases.mul_(processor.static_phases_mask)
         processor.xtalk.mul_(processor.xtalk_mask)
+
+        if processor.nonlinear:
+            processor.nl_factor.zero_()
+            processor.nl_factor.requires_grad = False
 
 
 def targeted_xtalk_escape(
@@ -489,6 +496,29 @@ if __name__ == "__main__":
     current_2pi = 17  # mA
 
     load_external_data = True
+    data_filepath = "../../data/unitary_measurement_20260121_1.npy"
+
+    # --- Multi-start configuration ---
+    num_starts = 10
+    target_fidelity = 0.9995
+    check_interval = 100
+    max_global_epochs = 100_000
+
+    # --- Stagnation & targeted escape configuration ---
+    escape_patience = 200
+    max_escape_attempts = 5
+    min_loss_delta = 1e-6
+
+    plot_lr_finder_every_start = True
+
+    mesh_choice = "Clements"
+    MeshClass = Bell if mesh_choice == "Bell" else Clements
+
+    n = 6
+    train_ratio = 0.8
+    current_2pi = 17  # mA
+
+    load_external_data = True
     data_filepath = "unitary_measurement_20260121_1.npy"
 
     # --- Multi-start configuration ---
@@ -515,16 +545,12 @@ if __name__ == "__main__":
         current_2pi=current_2pi,
         train_ratio=train_ratio,
     )
-
+    
     # MULTI-START OPTIMIZATION LOOP
     best_overall_fidelity = -1.0
     best_model_weights = None
-    interrupted = False  # set to True on a user-requested Ctrl+C stop
+    interrupted = False 
 
-    # Epoch counter and loss-history lists are shared across ALL starts,
-    # so the final convergence plot shows one continuous timeline rather
-    # than restarting from zero at each start.
-    global_epoch = 0
     continuous_epochs = []
     continuous_train_infid = []
     continuous_test_infid = []
@@ -532,13 +558,15 @@ if __name__ == "__main__":
     # The mesh/model are created once and reused across starts; each
     # start just reinitializes their parameters in-place (see below).
     processor = MeshClass(n_modes=n)
-    calib_model = CalibrationModel(processor)
+    calib_model = CalibrationModel(processor, nonlinear=True)
     criterion = nn.MSELoss()
     optimizer = optim.Adam(calib_model.parameters(), lr=1e-7)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.5, patience=100)
 
     for start_idx in range(num_starts):
         print(f" START {start_idx + 1}/{num_starts} ".center(75, '='))
+
+        nl_unfrozen = False # Flag per il curriculum learning
 
         if global_epoch >= max_global_epochs:
             print(f"Max global epochs ({max_global_epochs}) reached. Terminating optimization.")
@@ -623,6 +651,12 @@ if __name__ == "__main__":
                     start_failed = False
                     break
 
+            # --- CURRICULUM LEARNING: SCONGELAMENTO FATTORE NON-LINEARE ---
+            if processor.nonlinear and mean_fid_test > 0.99 and not nl_unfrozen:
+                print(f"\n[PHASE 2] Test Fidelity > 0.99 reached! Unfreezing 'nl_factor' for non-linear optimization.")
+                processor.nl_factor.requires_grad = True
+                nl_unfrozen = True
+            
             # --- TARGETED CROSS-TALK ESCAPE ---
             if epochs_no_improve >= escape_patience:
                 if escape_attempts >= max_escape_attempts:
