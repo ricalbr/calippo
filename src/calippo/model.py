@@ -241,7 +241,7 @@ class Mesh(nn.Module, ABC):
     def phases_from_currents(self, currents: torch.Tensor) -> torch.Tensor:
         """
         Calculate the optical phases for currents based on the cross-talk
-        coefficients and non-linear factors. Supports batches (B, n_phases) 
+        coefficients and non-linear factors. Supports batches (B, n_phases)
         or single (n_phases,).
 
         Parameters
@@ -1314,7 +1314,7 @@ if __name__ == "__main__":
         n = 24
         batch_size = 1000
         processor = Clements(n_modes=n)
-        
+
         # Initialize the processor activating the non-linear model
         processor = Clements(n_modes=n, nonlinear=True)
 

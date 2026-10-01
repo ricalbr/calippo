@@ -2,7 +2,7 @@
 """
 Multi-start calibration of a UPP mesh (Bell/Clements) via gradient descent
 on the amplitude-only forward model, with a targeted "cross-talk escape"
-mechanism to recover from stagnation and curriculum learning for the 
+mechanism to recover from stagnation and curriculum learning for the
 non-linear thermal phase components.
 
 Design summary
@@ -13,7 +13,7 @@ Design summary
 3. TARGETED ESCAPE: specific resets on anomalous cross-talk matrix entries.
 4. CURRICULUM LEARNING (NON-LINEAR): The non-linear thermal factor (nl_factor)
    is initially frozen to 0 to allow the optimizer to find the correct general
-   basin. Once test fidelity hits 0.99, it is unfrozen and jointly optimized 
+   basin. Once test fidelity hits 0.99, it is unfrozen and jointly optimized
    to reach the final precision target.
 """
 
@@ -25,6 +25,8 @@ import copy
 import matplotlib.pyplot as plt
 import traceback
 import time
+import pathlib
+import datetime
 
 from calippo.model import Bell, Clements
 from calippo.tools import amplitude_fidelity, sinkhorn
@@ -48,15 +50,15 @@ class CalibrationModel(nn.Module):
 
         # 2. Phase model: static phase + current-dependent cross-talk
         #    contribution with optional non-linear conditioning.
-        I2 = currents ** 2
-        
+        I2 = currents**2
+
         if self.mesh.nonlinear:
             # Active non-linear factors
             nl_active = self.mesh.nl_factor * self.mesh.static_phases_mask
             I2_eff = I2 * (1 + nl_active * I2)
         else:
             I2_eff = I2
-            
+
         phases = sp_active + I2_eff @ xt_active.T
 
         # 3. Native unitary propagation.
@@ -175,7 +177,7 @@ def circular_abs_error(a, b, period=2 * np.pi):
 
 def load_data(
     load_external: bool,
-    data_filepath: str | None = None,
+    data_filepath: str | pathlib.Path | None = None,
     train_ratio: float = 0.8,
     mesh_class: type | None = None,
     n_modes: int | None = None,
@@ -351,51 +353,6 @@ def targeted_xtalk_escape(
     return escape_attempts, epochs_no_improve, trigger_next_start, scheduler
 
 
-@torch.inference_mode()
-def apply_xtalk_bounds(mesh: torch.nn.Module) -> None:
-    """Applies physical bounds to cross-talk matrix parameters based on mean heater efficiency.
-
-    Diagonal self-efficiency entries are clamped within 50% of their mean
-    magnitude. Active off-diagonal coupling terms are clamped within 30% of the
-    mean diagonal magnitude.
-    """
-    # Extract diagonal view and active mask
-    # Extract zero-copy diagonal view and active mask
-    diag = mesh.xtalk.diagonal()  # type: ignore[attr-defined]
-    diag_mask = mesh.xtalk_mask.diagonal().bool()  # type: ignore[attr-defined]
-
-    valid_diag = diag[diag_mask]
-    if valid_diag.numel() == 0:
-        return
-
-    # Compute mean self-efficiency magnitude
-    mean_diag = valid_diag.abs().mean().clamp_min(1e-8)
-
-    # Clamp active diagonal entries preserving sign: [0.50 * mean, 1.50 * mean]
-    min_diag_mag = 0.50 * mean_diag
-    max_diag_mag = 1.50 * mean_diag
-
-    diag_sign = torch.sign(diag)
-    # Handle exact zero signs by preserving positive magnitude default
-    diag_sign[diag_sign == 0] = 1.0
-
-    clamped_diag_mag = diag.abs().clamp(min=min_diag_mag, max=max_diag_mag)
-    diag.copy_(diag_sign * clamped_diag_mag)
-
-    # 2. Clamp active off-diagonal magnitudes preserving sign: [0, 0.30 * mean]
-    offdiag_mask = mesh.xtalk_mask.bool().clone()  # type: ignore[attr-defined]
-    offdiag_mask.fill_diagonal_(False)
-
-    max_offdiag_mag = 0.30 * mean_diag
-    offdiag_data = mesh.xtalk.data[offdiag_mask]  # type: ignore[attr-defined]
-
-    offdiag_sign = torch.sign(offdiag_data)
-    offdiag_sign[offdiag_sign == 0] = 1.0
-
-    clamped_offdiag_mag = offdiag_data.abs().clamp(max=max_offdiag_mag)
-    mesh.xtalk.data[offdiag_mask] = offdiag_sign * clamped_offdiag_mag  # type: ignore[attr-defined]
-
-
 def run_start_diagnostics(
     start_idx: int,
     start_failed: bool,
@@ -494,38 +451,18 @@ if __name__ == "__main__":
     n = 6
     train_ratio = 0.8
     current_2pi = 17  # mA
+    weights_file = datetime.datetime.now().strftime("calibration_weights_%y%m%d_%H%M.pth")
 
     load_external_data = True
-    data_filepath = "../../data/unitary_measurement_20260121_1.npy"
-
-    # --- Multi-start configuration ---
-    num_starts = 10
-    target_fidelity = 0.9995
-    check_interval = 100
-    max_global_epochs = 100_000
-
-    # --- Stagnation & targeted escape configuration ---
-    escape_patience = 200
-    max_escape_attempts = 5
-    min_loss_delta = 1e-6
-
-    plot_lr_finder_every_start = True
-
-    mesh_choice = "Clements"
-    MeshClass = Bell if mesh_choice == "Bell" else Clements
-
-    n = 6
-    train_ratio = 0.8
-    current_2pi = 17  # mA
-
-    load_external_data = True
-    data_filepath = "unitary_measurement_20260121_1.npy"
+    data_filepath = (
+        pathlib.Path(__file__).resolve().parent.parent.parent / "data" / "unitary_measurement_20260121_1.npy"
+    )
 
     # --- Multi-start configuration ---
     num_starts = 10  # max number of independent random restarts
-    target_fidelity = 0.9985  # stop as soon as a start reaches this test fidelity
+    target_fidelity = 1 - 1e-5  # stop as soon as a start reaches this test fidelity
     check_interval = 100  # epochs between test-set evaluations
-    max_global_epochs = 100_000  # hard cap on epochs summed across ALL starts
+    max_global_epochs = 1_000_000  # hard cap on epochs summed across ALL starts
 
     # --- Stagnation & targeted escape configuration ---
     escape_patience = 200  # epochs with no raw-loss improvement before an escape is considered
@@ -545,11 +482,11 @@ if __name__ == "__main__":
         current_2pi=current_2pi,
         train_ratio=train_ratio,
     )
-    
+
     # MULTI-START OPTIMIZATION LOOP
     best_overall_fidelity = -1.0
     best_model_weights = None
-    interrupted = False 
+    interrupted = False
 
     continuous_epochs = []
     continuous_train_infid = []
@@ -557,16 +494,17 @@ if __name__ == "__main__":
 
     # The mesh/model are created once and reused across starts; each
     # start just reinitializes their parameters in-place (see below).
-    processor = MeshClass(n_modes=n)
-    calib_model = CalibrationModel(processor, nonlinear=True)
+    processor = MeshClass(n_modes=n, nonlinear=True)
+    calib_model = CalibrationModel(processor)
     criterion = nn.MSELoss()
     optimizer = optim.Adam(calib_model.parameters(), lr=1e-7)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.5, patience=100)
 
+    global_epoch = 0
     for start_idx in range(num_starts):
         print(f" START {start_idx + 1}/{num_starts} ".center(75, '='))
 
-        nl_unfrozen = False # Flag per il curriculum learning
+        nl_unfrozen = False  # Flag per il curriculum learning
 
         if global_epoch >= max_global_epochs:
             print(f"Max global epochs ({max_global_epochs}) reached. Terminating optimization.")
@@ -583,18 +521,18 @@ if __name__ == "__main__":
             U_mag_train,
             plot_result=(plot_lr_finder or start_idx == 0),
         )
-        optimizer.param_groups[0]["lr"] = optimal_lr
         optimizer.state.clear()
+        optimizer.param_groups[0]["lr"] = optimal_lr
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.5, patience=100)
+
+        print(f"Starting training (Target Fidelity: {target_fidelity})...")
+        start_time = time.perf_counter()
 
         best_loss_this_start = float('inf')
         epochs_no_improve = 0
         escape_attempts = 0
         final_test_fid = 0.0
         start_failed = True  # optimistic default flipped to False only on target reached
-
-        print(f"Starting training (Target Fidelity: {target_fidelity})...")
-        start_time = time.perf_counter()
 
         for global_epoch in range(global_epoch, max_global_epochs):
 
@@ -608,9 +546,8 @@ if __name__ == "__main__":
             scheduler.step(loss_train.detach())
 
             # --- STAGNATION TRACKING ---
-            current_loss = loss_train.item()
-
             # Absolute improvement of the training MSE.
+            current_loss = loss_train.item()
             if current_loss < best_loss_this_start - min_loss_delta:
                 best_loss_this_start = current_loss
                 epochs_no_improve = 0
@@ -619,8 +556,9 @@ if __name__ == "__main__":
 
             # --- PERIODIC TEST-SET EVALUATION ---
             if global_epoch % check_interval == 0:
-                elapsed_time = time.perf_counter() - start_time
-                start_time = time.perf_counter()
+                current_time = time.perf_counter()
+                elapsed_time = current_time - start_time
+                start_time = current_time
 
                 calib_model.eval()
                 with torch.inference_mode():
@@ -642,21 +580,19 @@ if __name__ == "__main__":
                 continuous_train_infid.append(1.0 - mean_fid_train)
                 continuous_test_infid.append(1.0 - mean_fid_test)
 
-                if mean_fid_test > best_overall_fidelity:
-                    best_overall_fidelity = mean_fid_test
-                    best_model_weights = {k: v.clone() for k, v in calib_model.state_dict().items()}
-
                 if mean_fid_test >= target_fidelity:
                     print(f"Target testing fidelity reached at Global Epoch {global_epoch}!")
                     start_failed = False
                     break
 
-            # --- CURRICULUM LEARNING: SCONGELAMENTO FATTORE NON-LINEARE ---
-            if processor.nonlinear and mean_fid_test > 0.99 and not nl_unfrozen:
-                print(f"\n[PHASE 2] Test Fidelity > 0.99 reached! Unfreezing 'nl_factor' for non-linear optimization.")
-                processor.nl_factor.requires_grad = True
-                nl_unfrozen = True
-            
+                # --- CURRICULUM LEARNING: SCONGELAMENTO FATTORE NON-LINEARE ---
+                if processor.nonlinear and mean_fid_test > 0.99 and not nl_unfrozen:
+                    print(
+                        f"\n[PHASE 2] Test Fidelity > 0.99 reached! Unfreezing 'nl_factor' for non-linear optimization."
+                    )
+                    processor.nl_factor.requires_grad = True
+                    nl_unfrozen = True
+
             # --- TARGETED CROSS-TALK ESCAPE ---
             if epochs_no_improve >= escape_patience:
                 if escape_attempts >= max_escape_attempts:
@@ -673,6 +609,13 @@ if __name__ == "__main__":
                         escape_patience=escape_attempts,
                         epochs_no_improve=epochs_no_improve,
                     )
+            
+        if mean_fid_test > best_overall_fidelity:
+            best_overall_fidelity = mean_fid_test
+            best_model_weights = {k: v.clone() for k, v in calib_model.state_dict().items()}
+
+            torch.save(calib_model.state_dict(), weights_file)
+            print(f"Model weights saved in: {weights_file}")
 
         # --- END OF RUN DIAGNOSTICS ---
         run_start_diagnostics(
@@ -698,11 +641,6 @@ if __name__ == "__main__":
         print(f"Loading best model with Test Fidelity: {best_overall_fidelity:.5f}")
         calib_model.load_state_dict(best_model_weights)
     else:
-        # Interrupted before any check_interval evaluation ever ran (e.g.
-        # within the first `check_interval` epochs of the very first
-        # start): there is no tracked "best" checkpoint yet, so fall back
-        # to whatever the model currently holds rather than crashing on
-        # `load_state_dict(None)`.
         print(
             "No checkpoint was recorded yet (interrupted very early) -- "
             "evaluating the current, largely untrained model instead."
