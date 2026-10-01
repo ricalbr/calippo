@@ -1333,7 +1333,7 @@ if __name__ == "__main__":
             f"  U -> currents calculation in {time.perf_counter()-start_t:.3f} s"
         )
 
-        # 3 Experimental matrix retrieval
+        # Experimental matrix retrieval
         phases_exp = processor.phases_from_currents(currents_target)
         u_exp_raw = processor.U_from_phases(phases_exp)
         u_exp, _, _ = make_real_border(u_exp_raw)

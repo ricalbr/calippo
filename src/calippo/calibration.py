@@ -185,7 +185,7 @@ if __name__ == "__main__":
         current_2pi = 16
 
         load_external_data = True
-        data_filepath = "../../data/unitary_measurement_20260121_1.npy"
+        data_filepath = "../../data/clements_6modes_gold_vienna/bkp/dataset_randhaars_n1000_20260121.npy"
 
         # --- Multi-start configuration ---
         num_starts = 10
