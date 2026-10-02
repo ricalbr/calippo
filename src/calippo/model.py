@@ -380,6 +380,24 @@ class Mesh(nn.Module, ABC):
     ) -> torch.Tensor:
         pass
 
+    def forward(self, currents):
+        # Mask gradients to enforce physical parameters and prevent optimizer artifacts.
+        # (the optimizer must not "invent" nonexistent coupling paths or heaters).
+        sp_active = self.static_phases * self.static_phases_mask
+        xt_active = self.xtalk * self.xtalk_mask
+
+        I2 = currents**2
+
+        if self.nonlinear:
+            nl_active = self.nl_factor * self.static_phases_mask
+            I2_eff = I2 * (1 + nl_active * I2)
+        else:
+            I2_eff = I2
+
+        phases = sp_active + I2_eff @ xt_active.T
+
+        U = self.U_from_phases(phases)
+        return torch.abs(U)
 
 @dataclasses.dataclass
 class MZIOp:
