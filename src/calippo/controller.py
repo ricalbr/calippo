@@ -92,6 +92,7 @@ class UniversalPhotonicProcessor:
         shifter_channels: Optional[List[int]] = None,
         switch_transient: float = 0.5,
         UPP_transient: float = 0.5,
+        use_power_meter: Optional[bool] = None,
         verbose: bool = True,
     ):
         self.num_modes = num_modes
@@ -119,28 +120,34 @@ class UniversalPhotonicProcessor:
         if len(self.shifter_map) != num_modes * (num_modes - 1):
             raise ValueError("[UPP][ERROR] Electrical mapping lists must match number of shifters N(N-1).")
 
-        # Initialize Hardware 1 & 2: Fiber Switch and Power Meter (Optional)
-        if switch_resource:
-            self.switch = FiberSwitch(switch_resource, transient=self.switch_transient, verbose=verbose)
-            self.pm = OPM150(power_unit=1, verbose=verbose)
-            self.pm.wavelength = wavelength_nm
-            self.pm.autorange_all(True)
-        else:
-            self.switch = None
-            self.pm = None
+        self.switch = None
+        self.pm = None
+        self.drv = None
 
-        # Initialize Hardware 3: Qontrol Driver (Optional)
-        if q8iv_resource:
-            self.drv = Q8iv(
-                q8iv_resource,
-                init_mode="i",
-                imax=self.imax,
-                vmax=self.vmax,
-                transient=self.UPP_transient,
-                verbose=verbose,
-            )
-        else:
-            self.drv = None
+        try:
+            if use_power_meter is None:
+                use_power_meter = switch_resource is not None
+
+            if switch_resource:
+                self.switch = FiberSwitch(switch_resource, transient=self.switch_transient, verbose=verbose)
+
+            if use_power_meter:
+                self.pm = OPM150(power_unit=1, verbose=verbose)
+                self.pm.wavelength = wavelength_nm
+                self.pm.autorange_all(True)
+
+            if q8iv_resource:
+                self.drv = Q8iv(
+                    q8iv_resource,
+                    init_mode="i",
+                    imax=self.imax,
+                    vmax=self.vmax,
+                    transient=self.UPP_transient,
+                    verbose=verbose,
+                )
+        except Exception:
+            self.close()   # rilascia ciò che era già stato aperto
+            raise
 
     def measure_power_matrix(self) -> np.ndarray:
         """
