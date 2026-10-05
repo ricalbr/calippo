@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import dataclasses
 import itertools
+import pathlib
 import pickle
 import time
 from abc import ABC, abstractmethod
@@ -37,12 +38,11 @@ import numpy as np
 import numpy.typing as npt
 import scipy as sp
 import torch
-import torch.nn as nn
 
 nparray = npt.NDArray
 
 
-class Mesh(nn.Module, ABC):
+class Mesh(torch.nn.Module, ABC):
     """
     Abstract base class for UPP meshes.
     It defines the common interface and internal structures that all mesh
@@ -93,9 +93,9 @@ class Mesh(nn.Module, ABC):
             sp_np, xt_np, nl_np = self.generate_random_calibration(1.0, 2 * np.pi)
 
         # Register as Parameters to enable training (e.g., with Adam)
-        self.static_phases = nn.Parameter(torch.from_numpy(sp_np).float())
-        self.xtalk = nn.Parameter(torch.from_numpy(xt_np).float())
-        self.nl_factor = nn.Parameter(torch.from_numpy(nl_np).float())
+        self.static_phases = torch.nn.Parameter(torch.from_numpy(sp_np).float())
+        self.xtalk = torch.nn.Parameter(torch.from_numpy(xt_np).float())
+        self.nl_factor = torch.nn.Parameter(torch.from_numpy(nl_np).float())
 
         # Output
         msg = (
@@ -399,6 +399,69 @@ class Mesh(nn.Module, ABC):
         U = self.U_from_phases(phases)
         return torch.abs(U)
 
+    def export_calibration(
+        self,
+        path: str | pathlib.Path,
+        state_dict: dict[str, torch.Tensor] | None = None,
+    ) -> pathlib.Path:
+        """Save the model's static phases, crosstalk matrix and nonlinear factor.
+
+        Parameters
+        ----------
+        path : str or pathlib.Path
+            Output file (parent folders are created).
+        state_dict : dict, optional
+            Weights to export instead of the model's current ones, e.g. the pipeline's
+            ``best_weights``. Must contain ``static_phases``, ``xtalk`` and ``nl_factor``.
+
+        Values are masked the same way ``Mesh.forward`` masks them, so the file holds the
+        effective parameters. ``nl_factor`` is always written, which also lets a nonlinear
+        model be rebuilt from the file.
+        """
+        source = state_dict if state_dict is not None else self.state_dict()
+
+        def param(name: str) -> np.ndarray:
+            return source[name].detach().cpu().numpy().astype(np.float64)
+
+        sp_mask = self.static_phases_mask.cpu().numpy()
+        xt_mask = self.xtalk_mask.cpu().numpy()
+
+        calibration = {
+            "N": int(self.n_modes),
+            "n_heaters": int(self.n_phases),
+            "static_phases": np.mod(param("static_phases") * sp_mask, 2 * np.pi),
+            "xt_matrix": param("xtalk") * xt_mask,
+            "nl_factor": param("nl_factor") * sp_mask,
+        }
+
+        path = pathlib.Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "wb") as f:
+            pickle.dump(calibration, f)
+
+        print(f"Calibration exported to {path}")
+        return path
+
+    def load_calibration(self, path: str | pathlib.Path) -> None:
+        """Load a calibration file into an existing model, in place.
+
+        Reuses ``model.import_calibration``, so size checks and masking behave exactly as when
+        passing ``calibration_file=`` to the constructor. For a linear model (``nonlinear=False``)
+        the file's ``nl_factor`` is ignored and the model's is set to zero.
+        """
+        static_phases, xtalk, nl_factor = self.import_calibration(str(path))
+
+        with torch.no_grad():
+            for param, value in (
+                (self.static_phases, static_phases),
+                (self.xtalk, xtalk),
+                (self.nl_factor, nl_factor),
+            ):
+                param.copy_(torch.from_numpy(np.asarray(value)).to(device=param.device, dtype=param.dtype))
+
+        print(f"Calibration loaded from {path}")
+
+
 @dataclasses.dataclass
 class MZIOp:
     """
@@ -424,6 +487,42 @@ class Clements(Mesh):
     """
     A photonic processor built according to the Clements scheme.
     """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # Static layer -> phase lookup used by U_from_phases. Non-persistent, so the
+        # state_dict (and any saved checkpoint) is unchanged.
+        self.register_buffer("_phase_index", self._build_phase_index(), persistent=False)
+
+    def _build_phase_index(self) -> torch.Tensor:
+        """
+        Build the (n_mixing_layers, n_modes) index table mapping each mode of each
+        layer to the phase it receives. Modes with no phase point to ``n_phases``,
+        which U_from_phases resolves to a zero padding column (multiplier = 1).
+        Internal phases are consumed from the start of the phase vector, external
+        ones from its second half, in the layer order of U_from_phases.
+        """
+        N, L = self.n_modes, self.n_mixing_layers
+        index = torch.full((L, N), self.n_phases, dtype=torch.long)
+
+        int_ptr, ext_ptr = 0, self.n_phases // 2
+        size_v1, size_v2 = N // 2, N // 2 - 1
+        pos_v1, pos_v2 = list(range(0, N, 2)), list(range(1, N - 1, 2))
+        # (is_internal, size, mode positions) for the repeating V1, V1, V2, V2 pattern
+        layer_specs = [
+            (False, size_v1, pos_v1),
+            (True, size_v1, pos_v1),
+            (False, size_v2, pos_v2),
+            (True, size_v2, pos_v2),
+        ]
+        for ii in range(L):
+            is_internal, size, positions = layer_specs[ii % 4]
+            if is_internal:
+                start, int_ptr = int_ptr, int_ptr + size
+            else:
+                start, ext_ptr = ext_ptr, ext_ptr + size
+            index[ii, positions] = torch.arange(start, start + size)
+        return index
 
     def _generate_masks(self) -> tuple[nparray, nparray]:
         """
@@ -463,9 +562,7 @@ class Clements(Mesh):
             xtalk_mask[start:end, start:end] = 1.0
 
         G_sizes = B_sizes[: self.n_modes - 2]
-        if G_sizes:
-            G_starts = [0] + np.cumsum(G_sizes).tolist()[:-1]
-
+        G_starts = [0] + np.cumsum(G_sizes).tolist()[:-1]
         row_idx = M + self.n_modes - 1
 
         # Calculate dependencies for the lower rows (Phis)
@@ -559,50 +656,20 @@ class Clements(Mesh):
             raise ValueError(f"Dimension mismatch: expected {self.n_phases} elements, found {phases.shape[-1]}.")
 
         B = phases.shape[0]
-        device = phases.device
 
-        # (B, N, N) identity array
-        U = torch.eye(self.n_modes, dtype=torch.complex128, device=device).unsqueeze(0).repeat(B, 1, 1)
+        # One gather + one exp for ALL layers -> (B, n_layers, N). Positions that carry
+        # no phase point at an appended zero column, so their multiplier is exactly 1.
+        padded = torch.nn.functional.pad(phases, (0, 1))
+        multipliers = torch.exp(1j * padded[:, self._phase_index].to(torch.complex128))
 
-        # Pointers for internal and external phases
-        int_ptr = 0
-        ext_ptr = self.n_phases // 2
-
-        # Sizes for each layer type
-        size_v1 = self.n_modes // 2
-        size_v2 = self.n_modes // 2 - 1
-
-        idx_v1 = torch.arange(0, self.n_modes, 2, device=device)
-        idx_v2 = torch.arange(1, self.n_modes - 1, 2, device=device)
-
-        # Layer structure: (is_internal, size_v, indices)
-        layer_specs = [
-            (False, size_v1, idx_v1),  # pattern 0: V1 ext
-            (True, size_v1, idx_v1),  # pattern 1: V1 int
-            (False, size_v2, idx_v2),  # pattern 2: V2 ext
-            (True, size_v2, idx_v2),  # pattern 3: V2 int
-        ]
-
-        def consume_phases(phase_tensor, ptr, size):
-            return phase_tensor[:, ptr : ptr + size], ptr + size
-
+        # Propagate V = U^T instead of U. Each layer U <- M @ (diag(p) @ U) becomes
+        # V <- (V * p) @ M^T, a (B, N, N) @ (N, N) product that PyTorch folds into a
+        # single (B*N, N) GEMM instead of B tiny batched matmuls. No in-place ops.
+        V = torch.eye(self.n_modes, dtype=torch.complex128, device=phases.device).expand(B, -1, -1)
         for ii in range(self.n_mixing_layers):
-            is_internal, size_v, indices = layer_specs[ii % 4]
+            V = (V * multipliers[:, ii].unsqueeze(1)) @ self.M[ii].T
 
-            if is_internal:
-                layer_phases, int_ptr = consume_phases(phases, int_ptr, size_v)
-            else:
-                layer_phases, ext_ptr = consume_phases(phases, ext_ptr, size_v)
-
-            phase_multiplier = torch.ones((B, self.n_modes), dtype=torch.complex128, device=device)
-            phase_multiplier[:, indices] = torch.exp(1j * layer_phases.to(torch.complex128))
-
-            # Broadcasting phase multiplier along rows: (B, N, 1)
-            U = U * phase_multiplier.unsqueeze(2)
-
-            # Multiplication by the current mixing layer
-            U = torch.matmul(self.M[ii], U)
-
+        U = V.transpose(1, 2).contiguous()
         return U.squeeze(0) if is_1d else U
 
     def phases_from_U(self, U_target: torch.Tensor, target_infidelity: float = 1e-6, **kwargs) -> torch.Tensor:
@@ -1323,8 +1390,9 @@ class Bell(Mesh):
 
 if __name__ == "__main__":
 
-    from tools import fidelity, get_haar_unitary, make_real_border
     import traceback
+
+    from tools import fidelity, get_haar_unitary, make_real_border
 
     processor = None
 
