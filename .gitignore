@@ -209,5 +209,5 @@ __marimo__/
 
 # Weights and datasets
 *.pth
-./src/**/*.npy
-./src/**/*.npyz
+/src/**/*.npy
+/src/**/*.npz
