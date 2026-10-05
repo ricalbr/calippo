@@ -32,40 +32,6 @@ from calippo.model import Bell, Clements
 from calippo.tools import amplitude_fidelity, sinkhorn
 
 
-class CalibrationModel(nn.Module):
-    """
-    Wrapper to train the mesh parameters while strictly enforcing
-    the physical constraints (masks) during the forward pass.
-    """
-
-    def __init__(self, mesh_instance):
-        super().__init__()
-        self.mesh = mesh_instance
-
-    def forward(self, currents):
-        # Mask gradients to enforce physical parameters and prevent optimizer artifacts.
-        # (the optimizer must not "invent" nonexistent coupling paths or heaters).
-        sp_active = self.mesh.static_phases * self.mesh.static_phases_mask
-        xt_active = self.mesh.xtalk * self.mesh.xtalk_mask
-
-        # 2. Phase model: static phase + current-dependent cross-talk
-        #    contribution with optional non-linear conditioning.
-        I2 = currents**2
-
-        if self.mesh.nonlinear:
-            # Active non-linear factors
-            nl_active = self.mesh.nl_factor * self.mesh.static_phases_mask
-            I2_eff = I2 * (1 + nl_active * I2)
-        else:
-            I2_eff = I2
-
-        phases = sp_active + I2_eff @ xt_active.T
-
-        # 3. Native unitary propagation.
-        U = self.mesh.U_from_phases(phases)
-        return torch.abs(U)
-
-
 def lr_finder(
     model, optimizer, criterion, I_train, U_target_train, init_lr=1e-7, max_lr=10.0, steps=100, plot_result=False
 ):
@@ -255,7 +221,7 @@ def reinitialize_processor_parameters(processor, current_2pi: float) -> None:
 
 
 def targeted_xtalk_escape(
-    calib_model,
+    processor,
     optimizer,
     optimal_lr: float,
     scheduler,
@@ -276,13 +242,12 @@ def targeted_xtalk_escape(
 
     # Use inference_mode to avoid tracking autograd operations during targeted reset
     with torch.inference_mode():
-        mesh = calib_model.mesh
-        xt_active = mesh.xtalk * mesh.xtalk_mask
+        xt_active = processor.xtalk * processor.xtalk_mask
         n_p = xt_active.shape[0]
 
         # Diagonal anomalies (self heater-efficiency)
         diag = xt_active.diagonal()
-        diag_mask = mesh.xtalk_mask.diagonal().bool()
+        diag_mask = processor.xtalk_mask.diagonal().bool()
 
         valid_diag = diag[diag_mask]
         mean_diag = (
@@ -296,10 +261,10 @@ def targeted_xtalk_escape(
         bad_diag_mask = (diag_deviation > 0.50) & diag_mask
 
         # Off-diagonal anomalies (cross-heater coupling >30% of mean diagonal)
-        offdiag_mask = mesh.xtalk_mask.bool().clone()
+        offdiag_mask = processor.xtalk_mask.bool().clone()
         offdiag_mask.fill_diagonal_(False)
 
-        offdiag_ratio_2d = mesh.xtalk.abs() / mean_diag
+        offdiag_ratio_2d = processor.xtalk.abs() / mean_diag
         bad_offdiag_mask_2d = offdiag_mask & (offdiag_ratio_2d > 0.30)
 
         has_bad_diag = bad_diag_mask.any()
@@ -310,21 +275,21 @@ def targeted_xtalk_escape(
 
             # Reset anomalous off-diagonal entries
             if has_bad_offdiag:
-                mesh.xtalk.data[bad_offdiag_mask_2d] = (
-                    torch.sign(mesh.xtalk.data[bad_offdiag_mask_2d]) * 0.10 * mean_diag
+                processor.xtalk.data[bad_offdiag_mask_2d] = (
+                    torch.sign(processor.xtalk.data[bad_offdiag_mask_2d]) * 0.10 * mean_diag
                 )
 
             # Reset anomalous diagonal entries & randomize static phases
             if has_bad_diag:
-                diag_data = mesh.xtalk.data.diagonal()
+                diag_data = processor.xtalk.data.diagonal()
                 diag_data[bad_diag_mask] = torch.sign(diag_data[bad_diag_mask]) * mean_diag
 
-                bad_sp_mask = bad_diag_mask & mesh.static_phases_mask.bool()
+                bad_sp_mask = bad_diag_mask & processor.static_phases_mask.bool()
                 num_bad_sp = bad_sp_mask.sum().item()
 
                 if num_bad_sp > 0:
-                    mesh.static_phases.data[bad_sp_mask] = (
-                        torch.rand(num_bad_sp, dtype=mesh.static_phases.dtype, device=mesh.static_phases.device)
+                    processor.static_phases.data[bad_sp_mask] = (
+                        torch.rand(num_bad_sp, dtype=processor.static_phases.dtype, device=processor.static_phases.device)
                         * 2
                         * torch.pi
                     )
@@ -357,7 +322,7 @@ def run_start_diagnostics(
     start_idx: int,
     start_failed: bool,
     final_test_fid: float,
-    calib_model: torch.nn.Module,
+    processor: torch.nn.Module,
     circular_abs_error,
     gt_processor: torch.nn.Module | None = None,
     plot_per_start: bool = False,
@@ -370,9 +335,8 @@ def run_start_diagnostics(
     print(f"\n[DIAGNOSTICS] Start {start_idx + 1} {status_str} " f"(Final Test Fid: {final_test_fid:.5f}).")
 
     with torch.inference_mode():
-        mesh = calib_model.mesh  # type: ignore[attr-defined]
-        est_sp = np.mod((mesh.static_phases * mesh.static_phases_mask).cpu().numpy(), 2 * np.pi)
-        est_xt = (mesh.xtalk * mesh.xtalk_mask).cpu().numpy()
+        est_sp = np.mod((processor.static_phases * processor.static_phases_mask).cpu().numpy(), 2 * np.pi)
+        est_xt = (processor.xtalk * processor.xtalk_mask).cpu().numpy()
 
     if gt_processor is not None:
         print("Analyzing parameter errors against Ground Truth...")
@@ -442,7 +406,7 @@ def run_start_diagnostics(
 
 if __name__ == "__main__":
 
-    calib_model = None
+    processor = None
     gt_processor = None
 
     mesh_choice = "Clements"
@@ -495,9 +459,8 @@ if __name__ == "__main__":
     # The mesh/model are created once and reused across starts; each
     # start just reinitializes their parameters in-place (see below).
     processor = MeshClass(n_modes=n, nonlinear=True)
-    calib_model = CalibrationModel(processor)
     criterion = nn.MSELoss()
-    optimizer = optim.Adam(calib_model.parameters(), lr=1e-7)
+    optimizer = optim.Adam(processor.parameters(), lr=1e-7)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.5, patience=100)
 
     global_epoch = 0
@@ -514,7 +477,7 @@ if __name__ == "__main__":
 
         print("Running automated LR finder...")
         optimal_lr = lr_finder(
-            calib_model,
+            processor,
             optimizer,
             criterion,
             I_train,
@@ -536,13 +499,13 @@ if __name__ == "__main__":
 
         for global_epoch in range(global_epoch, max_global_epochs):
 
-            calib_model.train()
+            processor.train()
             optimizer.zero_grad(set_to_none=False)
-            U_mag_pred_train = calib_model(I_train)
+            U_mag_pred_train = processor(I_train)
             loss_train = criterion(U_mag_pred_train, U_mag_train)
             loss_train.backward()
             optimizer.step()
-            # apply_xtalk_bounds(calib_model.mesh)
+            # apply_xtalk_bounds(processor.mesh)
             scheduler.step(loss_train.detach())
 
             # --- STAGNATION TRACKING ---
@@ -560,9 +523,9 @@ if __name__ == "__main__":
                 elapsed_time = current_time - start_time
                 start_time = current_time
 
-                calib_model.eval()
+                processor.eval()
                 with torch.inference_mode():
-                    U_mag_pred_test = calib_model(I_test)
+                    U_mag_pred_test = processor(I_test)
 
                     mean_fid_train = amplitude_fidelity(U_train, U_mag_pred_train.detach()).mean().item()
                     mean_fid_test = amplitude_fidelity(U_test, U_mag_pred_test).mean().item()
@@ -600,7 +563,7 @@ if __name__ == "__main__":
                     break
                 else:
                     escape_attempts, epochs_no_improve, trigger_next_start, scheduler = targeted_xtalk_escape(
-                        calib_model=calib_model,
+                        processor=processor,
                         optimizer=optimizer,
                         optimal_lr=optimal_lr,
                         scheduler=scheduler,
@@ -609,12 +572,12 @@ if __name__ == "__main__":
                         escape_patience=escape_attempts,
                         epochs_no_improve=epochs_no_improve,
                     )
-            
+
         if mean_fid_test > best_overall_fidelity:
             best_overall_fidelity = mean_fid_test
-            best_model_weights = {k: v.clone() for k, v in calib_model.state_dict().items()}
+            best_model_weights = {k: v.clone() for k, v in processor.state_dict().items()}
 
-            torch.save(calib_model.state_dict(), weights_file)
+            torch.save(processor.state_dict(), weights_file)
             print(f"Model weights saved in: {weights_file}")
 
         # --- END OF RUN DIAGNOSTICS ---
@@ -622,7 +585,7 @@ if __name__ == "__main__":
             start_idx=start_idx,
             start_failed=start_failed,
             final_test_fid=final_test_fid,
-            calib_model=calib_model,
+            processor=processor,
             circular_abs_error=circular_abs_error,
             gt_processor=gt_processor,
         )
@@ -639,17 +602,17 @@ if __name__ == "__main__":
 
     if best_model_weights is not None:
         print(f"Loading best model with Test Fidelity: {best_overall_fidelity:.5f}")
-        calib_model.load_state_dict(best_model_weights)
+        processor.load_state_dict(best_model_weights)
     else:
         print(
             "No checkpoint was recorded yet (interrupted very early) -- "
             "evaluating the current, largely untrained model instead."
         )
 
-    calib_model.eval()
+    processor.eval()
 
     with torch.no_grad():
-        U_mag_pred_final_test = calib_model(I_test)
+        U_mag_pred_final_test = processor(I_test)
         final_test_fidelities = amplitude_fidelity(U_test, U_mag_pred_final_test).numpy()
 
     # Full training history across ALL starts on one timeline.
