@@ -695,8 +695,8 @@ class Clements(Mesh):
         phases = torch.cat([th, ph], dim=1)
 
         # Remapping the redundant external phases (exluding the first n / 2, not involved in any MZI ring)
-        idx_start = self.n_phases // 2 + n // 2
-        idx_end = self.n_phases // 2 + (n - 1)
+        idx_start = self.n_phases // 2 + self.n_modes // 2
+        idx_end = self.n_phases // 2 + (self.n_modes - 1)
         delta = int(idx_end - idx_start)
         counter = 1
 
