@@ -24,7 +24,7 @@ class TrainingConfig:
     num_starts: int = 10
     target_fidelity: float = 1 - 1e-4
     max_global_epochs: int = 1_000_000
-    check_interval: int = 150
+    check_interval: int = 100
 
     # Stagnation & Escape Params
     escape_patience: int = 300
@@ -34,11 +34,11 @@ class TrainingConfig:
     # Optimization
     initial_lr: float = 1e-7
     lr_scheduler_patience: int = 100
-    lr_scheduler_factor: float = 0.5
+    lr_scheduler_factor: float = 0.25
 
 
 def lr_finder(
-    model, optimizer, criterion, i_train, u_target_train, init_lr=1e-7, max_lr=1.0, steps=1000, plot_result=True
+    model, optimizer, criterion, i_train, u_target_train, init_lr=1e-7, max_lr=1.0, steps=100, plot_result=True
 ):
     """
     Classic LR range test: ramp the learning rate exponentially from
@@ -215,7 +215,7 @@ class Trainer:
         self.init_optimizer(lr=1e-7)
 
     def init_optimizer(self, lr: float):
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr)
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer, factor=self.config.lr_scheduler_factor, patience=self.config.lr_scheduler_patience
         )
@@ -264,9 +264,9 @@ class TrainingPipeline:
         self.trainer.init_optimizer(opt_lr)
 
         global_epoch = 0
-        for start_idx in range(self.config.num_starts):
-            print(f" START {start_idx + 1}/{self.config.num_starts} ".center(100, '-'))
-            while global_epoch < self.config.max_global_epochs:
+        while global_epoch < self.config.max_global_epochs:
+            for start_idx in range(self.config.num_starts):
+                print(f" START {start_idx + 1}/{self.config.num_starts} ".center(100, '-'))
                 # Start Training Loop
                 success, epochs_spent = self._execute_start(
                     i_train, u_mag_train, i_test, u_test, opt_lr, current_epoch=global_epoch
@@ -276,18 +276,18 @@ class TrainingPipeline:
                 if success:
                     print(f"Target fidelity achieved in start {start_idx+1}!")
                     break
+            break
 
     def _execute_start(self, i_train, u_mag_train, i_test, u_test, opt_lr, current_epoch) -> tuple[bool, int]:
         best_loss_this_start = float('inf')
         epochs_no_improve = 0
         escape_attempts = 0
         nl_unfrozen = False
-
-        epoch = current_epoch
+        old_epoch = current_epoch
 
         start_time = time.perf_counter()
-        while epoch < self.config.max_global_epochs:
-            epoch += 1
+        while current_epoch< self.config.max_global_epochs:
+            current_epoch += 1
             loss = self.trainer.train_one_epoch(i_train, u_mag_train)
 
             # Stagnation Tracking
@@ -297,14 +297,14 @@ class TrainingPipeline:
                 epochs_no_improve += 1
 
             # Evaluation & Curriculum
-            if epoch % self.config.check_interval == 0 and epoch != 0:
+            if current_epoch % self.config.check_interval == 0 and current_epoch != 0:
                 current_time = time.perf_counter()
                 elapsed_time = current_time - start_time
                 start_time = current_time
 
                 fid_test = self.trainer.evaluate(i_test, u_test)
                 print(
-                    f"Global Epoch {epoch:6d} |",
+                    f"Global Epoch {current_epoch:6d} |",
                     f"LR: {self.trainer.optimizer.param_groups[0]['lr']:.2e} |",
                     # f"Train Fid: {self.trainer.optimizer.lr:.5f} |",
                     f"Test Fid: {fid_test:.5f} |",
@@ -313,7 +313,7 @@ class TrainingPipeline:
                 )
 
                 if fid_test >= self.config.target_fidelity:
-                    return True, epoch
+                    return True, current_epoch-old_epoch
 
                 if self.trainer.model.nonlinear and fid_test > 0.99 and not nl_unfrozen:
                     print("\n[PHASE 2] High fidelity reached. Unfreezing nl_factor.")
@@ -323,13 +323,14 @@ class TrainingPipeline:
                 if fid_test > self.best_overall_fidelity:
                     self.best_overall_fidelity = fid_test
                     self.best_weights = {k: v.clone() for k, v in self.trainer.model.state_dict().items()}
+
             # Escape Logic
             if epochs_no_improve >= self.config.escape_patience:
                 if escape_attempts >= self.config.max_escape_attempts:
                     print("Max escape attempts reached. Abandoning start.")
-                    return False, epoch
+                    return False, current_epoch-old_epoch
 
-                # Perform Targeted Escape
+                # Check cross-talk matrix
                 bad_diag, bad_off, mean_diag = CrosstalkManager.analyze_anomalies(self.trainer.model)
 
                 if bad_diag.any() or bad_off.any():
@@ -339,13 +340,15 @@ class TrainingPipeline:
                     # Reset Optimizer state after physical reset
                     self.trainer.init_optimizer(opt_lr)
                     epochs_no_improve = 0
-                    print(f"Update cross-talk matrix. {np.sum(bad_diag) + np.sum(bad_off)} elements were off.")
+
+                    # TODO: count elements that where off
+                    print(f"Update cross-talk matrix. Found {len(range(10))} ill-elements.")
                     print(f"Targeted Escape {escape_attempts}/{self.config.max_escape_attempts} applied.")
                 else:
                     print("Stagnation detected but no anomalies found. Moving to next start.")
-                    return False, epoch
+                    return False, current_epoch-old_epoch
 
-        return False, self.config.max_global_epochs
+        return False, current_epoch-old_epoch
 
 
 def load_data(
