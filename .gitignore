@@ -211,3 +211,5 @@ __marimo__/
 *.pth
 /src/**/*.npy
 /src/**/*.npz
+/src/**/*.pkl
+/src/**/*.pickle
