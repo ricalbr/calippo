@@ -160,7 +160,7 @@ def reinitialize_model_parameters(processor, current_2pi: float) -> None:
             processor.nl_factor.requires_grad = False
 
 
-# CROSSTALK MANAGER (Physics Logic)
+# CROSSTALK MANAGER
 class CrosstalkManager:
     """Handles detection and resetting of anomalous crosstalk coefficients."""
 
@@ -215,7 +215,7 @@ class Trainer:
         self.init_optimizer(lr=1e-7)
 
     def init_optimizer(self, lr: float):
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr)
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer, factor=self.config.lr_scheduler_factor, patience=self.config.lr_scheduler_patience
         )
@@ -276,6 +276,11 @@ class TrainingPipeline:
                 if success:
                     print(f"Target fidelity achieved in start {start_idx+1}!")
                     break
+
+                # Re-init and Find LR
+                opt_lr = lr_finder(self.trainer.model, self.trainer.optimizer, self.trainer.criterion, i_train, u_mag_train)
+                reinitialize_model_parameters(self.trainer.model, self.config.current_2pi)
+                self.trainer.init_optimizer(opt_lr)
             break
 
     def _execute_start(self, i_train, u_mag_train, i_test, u_test, opt_lr, current_epoch) -> tuple[bool, int]:
@@ -286,7 +291,7 @@ class TrainingPipeline:
         old_epoch = current_epoch
 
         start_time = time.perf_counter()
-        while current_epoch< self.config.max_global_epochs:
+        while current_epoch < self.config.max_global_epochs:
             current_epoch += 1
             loss = self.trainer.train_one_epoch(i_train, u_mag_train)
 
@@ -313,11 +318,12 @@ class TrainingPipeline:
                 )
 
                 if fid_test >= self.config.target_fidelity:
-                    return True, current_epoch-old_epoch
+                    return True, current_epoch - old_epoch
 
                 if self.trainer.model.nonlinear and fid_test > 0.99 and not nl_unfrozen:
-                    print("\n[PHASE 2] High fidelity reached. Unfreezing nl_factor.")
+                    print("fidelity reached. Unfreezing nl_factor.")
                     self.trainer.model.nl_factor.requires_grad = True
+                    nl_unfrozen = True
 
                 # Save best weights globally
                 if fid_test > self.best_overall_fidelity:
@@ -328,7 +334,7 @@ class TrainingPipeline:
             if epochs_no_improve >= self.config.escape_patience:
                 if escape_attempts >= self.config.max_escape_attempts:
                     print("Max escape attempts reached. Abandoning start.")
-                    return False, current_epoch-old_epoch
+                    return False, current_epoch - old_epoch
 
                 # Check cross-talk matrix
                 bad_diag, bad_off, mean_diag = CrosstalkManager.analyze_anomalies(self.trainer.model)
@@ -341,14 +347,13 @@ class TrainingPipeline:
                     self.trainer.init_optimizer(opt_lr)
                     epochs_no_improve = 0
 
-                    # TODO: count elements that where off
-                    print(f"Update cross-talk matrix. Found {len(range(10))} ill-elements.")
+                    print(f"Update cross-talk matrix. Found {torch.sum(bad_diag) + torch.sum(bad_off)} ill-elements.")
                     print(f"Targeted Escape {escape_attempts}/{self.config.max_escape_attempts} applied.")
                 else:
                     print("Stagnation detected but no anomalies found. Moving to next start.")
-                    return False, current_epoch-old_epoch
+                    return False, current_epoch - old_epoch
 
-        return False, current_epoch-old_epoch
+        return False, current_epoch - old_epoch
 
 
 def load_data(
@@ -372,7 +377,6 @@ def load_data(
     print(f"Loading external experimental data from {data_filepath}...")
 
     data = np.load(data_filepath)
-
     currents = torch.from_numpy(data["currents"]).float()
     u_exp = torch.from_numpy(data["u_exp"])
     u_exp = torch.sqrt(sinkhorn(u_exp)[0])
