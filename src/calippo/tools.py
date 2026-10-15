@@ -29,7 +29,7 @@ import numpy as np
 from typing import Tuple
 
 
-def sinkhorn(U: np.ndarray, tol: float = 1e-6, max_iter: int = 1000) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def sinkhorn(U: np.ndarray, tol: float = 1e-6, max_iter: int = 5000) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Normalize a (batch of) positive matrices using the Sinkhorn–Knopp algorithm.
 

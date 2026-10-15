@@ -931,9 +931,10 @@ class Bell(Mesh):
     def phases_from_U(
         self,
         U_target: nparray,
-        max_iter: int = 100000,
+        max_iter: int = 20000,
         target_infidelity: float = 1e-6,
         plot_graph: bool = False,
+        return_info: bool = False, # to manage matrices that converge
         **kwargs,
     ) -> nparray:
         """
@@ -1023,6 +1024,9 @@ class Bell(Mesh):
                 )
 
         print(f"--- Elapsed time: {(time.time() - start_time):.2f} seconds.")
+        
+        final_infidelity = 1 - fid
+        converged = final_infidelity < target_infidelity
 
         # Vectorized cleanup and restoration
         phase_terms = np.angle(phase_terms)  # Phases are now real numbers
@@ -1042,6 +1046,8 @@ class Bell(Mesh):
         if is_2d:
             phases = phases[0]
             fidelity_monitor = fidelity_monitor[0]
+            final_infidelity = final_infidelity[0]
+            converged = converged[0]
 
         # Output for debug
         if plot_graph:
@@ -1053,6 +1059,8 @@ class Bell(Mesh):
             ax.grid(True, linestyle=":", alpha=0.6)
             plt.show()
 
+        if return_info:
+            return phases, {"infidelity": final_infidelity, "converged": converged}
         return phases
 
 
