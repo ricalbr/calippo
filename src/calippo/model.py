@@ -340,19 +340,30 @@ class Mesh(torch.nn.Module, ABC):
 
         # Cast xtalk to match the dtype of the input phases
         xtalk = self.xtalk[used_rows][:, used_rows].to(phases.dtype)
+        diag_alpha = torch.diagonal(xtalk).unsqueeze(1)
 
         # Numerical inversion.
         # The equation is: xtalk @ I2_eff^T = (phases_used - static_phases)^T
         # We transpose to align the batch axis (B) as the last dimension
-        target_diff = (phases_used - static_phases).T
+        target_diff = torch.remainder((phases_used - static_phases).T, 2*torch.pi)
+
         I2_eff = torch.linalg.solve(xtalk, target_diff)
 
         # Keep 2*pi in the same dtype
-        pi_tensor = torch.tensor(2 * torch.pi, dtype=phases.dtype, device=phases.device)
+        TWO_PI = torch.tensor(2 * torch.pi, dtype=phases.dtype, device=phases.device)
+        limit = 1.2
 
-        while torch.any(I2_eff < 0):
-            target_diff[I2_eff < 0] += pi_tensor
+        negative = I2_eff < 0
+        exceeds = (I2_eff * diag_alpha) > (limit * TWO_PI)
+
+        while negative.any() or exceeds.any():
+            target_diff += negative.to(phases.dtype) * TWO_PI
+            target_diff -= exceeds.to(phases.dtype) * TWO_PI
+
             I2_eff = torch.linalg.solve(xtalk, target_diff)
+
+            negative = I2_eff < 0
+            exceeds = (I2_eff * diag_alpha) > (limit * TWO_PI)
 
         # Transpose back and reconstruct original dimensions
         I2_eff = I2_eff.T
