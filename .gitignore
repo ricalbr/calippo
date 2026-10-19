@@ -209,7 +209,7 @@ __marimo__/
 
 # Weights and datasets
 *.pth
-/src/**/*.npy
-/src/**/*.npz
-/src/**/*.pkl
-/src/**/*.pickle
+src/**/*.npy
+src/**/*.npz
+src/**/*.pkl
+src/**/*.pickle
