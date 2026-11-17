@@ -160,7 +160,6 @@ def reinitialize_model_parameters(processor, current_2pi: float) -> None:
             processor.nl_factor.requires_grad = False
 
 
-# CROSSTALK MANAGER
 class CrosstalkManager:
     """Handles detection and resetting of anomalous crosstalk coefficients."""
 
@@ -380,48 +379,6 @@ def load_data(
     currents = torch.from_numpy(data["currents"]).float()
     u_exp = torch.from_numpy(data["u_exp"])
     u_exp = torch.sqrt(sinkhorn(u_exp)[0])
-
-    return split_train_test(currents, u_exp, train_ratio=train_ratio)
-
-
-def generate_synthetic_data(
-    processor: torch.nn.Module,
-    nonlinear: bool = False,
-    n_modes: int | None = None,
-    current_2pi: float | None = None,
-    mock_samples: int = 10_000,
-    train_ratio: float = 0.8,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Synthesize mock data using a mesh model.
-
-    Parameters
-    ----------
-    processor : torch.nn.Module
-        Mesh model used to synthesize mock data.
-    nonlinear : bool, default=False
-        Whether to use the nonlinear model.
-    n_modes : int, optional
-        Number of modes to retain. If ``None``, all modes are used.
-    current_2pi : float, optional
-        Scaling factor applied to the currents. If ``None``, no scaling is applied.
-    mock_samples : int, default=10000
-        Number of mock samples to synthesize.
-    train_ratio : float, default=0.8
-        Fraction of the data to use for training.
-
-    Returns
-    -------
-    tuple[torch.Tensor, torch.Tensor]
-        A tuple containing the currents and U_measured tensors.
-    """
-    print("Generating mock experimental data...")
-
-    gt_processor = processor(n_modes=n_modes, nonlinear=nonlinear)
-
-    currents = gt_processor.generate_random_currents(current_ampl=current_2pi, batch_size=mock_samples)
-    with torch.no_grad():
-        phases_exp = gt_processor.phases_from_currents(currents)
-        u_exp = gt_processor.U_from_phases(phases_exp)
 
     return split_train_test(currents, u_exp, train_ratio=train_ratio)
 
