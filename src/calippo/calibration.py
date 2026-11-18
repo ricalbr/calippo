@@ -37,9 +37,77 @@ class TrainingConfig:
     lr_scheduler_factor: float = 0.25
 
 
+sign_data = [
+    [1, -1, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [1, 1, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 1, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 1, -1, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 1, 1, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 1, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, -1, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, -1, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, -1, -1, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, -1, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 1, 1, 1, -1, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, -1, 1, -1, 0, 0, 0, 0, 0],
+    [0, 0, 0, 1, 1, 1, 1, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0],
+    [0, 0, 0, 1, 1, 1, -1, -1, -1, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, -1, -1, -1, 1, -1, -1, 0, 0],
+    [0, 0, 0, 1, 1, 1, 1, -1, 1, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, -1, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0],
+    [0, 0, 0, 1, 1, 1, 1, -1, 1, -1, 1, -1, -1, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, -1, 1, -1],
+    [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1],
+]
+
+def apply_constraints(model):
+    with torch.no_grad():
+        model.mesh.xtalk.data = model.mesh.xtalk.abs() * torch.from_numpy(np.array(sign_data))
+        model.mesh.nl_factor.data = model.mesh.nl_factor.abs()
+
+
+def _plot_lr_finder(lrs, losses, optimal_lr, optimal_loss, noise_idx):
+    """Plot the LR range test curve with the optimal and noise-onset points marked."""
+    plt.figure(figsize=(8, 5))
+    plt.plot(lrs, losses, label='Raw Loss', color='blue')
+    plt.scatter(
+        optimal_lr, optimal_loss, color='red', s=50, zorder=5,
+        label=f'Optimal LR: {optimal_lr:.2e}',
+    )
+    plt.scatter(
+        lrs[noise_idx], losses[noise_idx], color='orange', s=50, zorder=4,
+        label='First Minimum (Noise Start)', marker='X',
+    )
+    plt.xscale('log')
+    plt.xlabel('Learning Rate')
+    plt.ylabel('Loss (MSE)')
+    plt.title('Learning Rate Finder (Pre-Noise Steepest Descent)')
+    plt.grid(True, which='both', ls='--', alpha=0.5)
+    plt.legend()
+    plt.show()
+
+
 def lr_finder(
-    model, optimizer, criterion, i_train, u_target_train, init_lr=1e-7, max_lr=1.0, steps=100, plot_result=True
-):
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    criterion: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+    i_train: torch.Tensor,
+    u_target_train: torch.Tensor,
+    init_lr: float = 1e-7,
+    max_lr: float = 1.0,
+    steps: int = 100,
+    plot_result: bool = True,
+) -> float:
     """
     Classic LR range test: ramp the learning rate exponentially from
     `init_lr` to `max_lr` over `steps` optimizer steps, and pick the LR at
@@ -52,112 +120,89 @@ def lr_finder(
     initial_state = copy.deepcopy(model.state_dict())
     initial_optim = copy.deepcopy(optimizer.state_dict())
 
+    param_group = optimizer.param_groups[0]
+    param_group['lr'] = init_lr
     mult = (max_lr / init_lr) ** (1 / steps)
-    optimizer.param_groups[0]['lr'] = init_lr
 
     lrs = []
     losses = []
-    best_loss = float('inf')
+    best_loss = math.inf
 
     model.train()
-    for i in range(steps):
+    for _ in range(steps):
         optimizer.zero_grad()
-        u_mag_pred = model(i_train)
-        loss = criterion(u_mag_pred, u_target_train)
+        loss = criterion(model(i_train), u_target_train)
+        loss_val = loss.item()  # single host-device sync per step
 
         # Abort the sweep early if the loss has diverged.
-        if loss.item() > 10 * best_loss or torch.isnan(loss):
+        if loss_val > 10 * best_loss or torch.isnan(loss):
             break
 
-        if loss.item() < best_loss:
-            best_loss = loss.item()
+        best_loss = min(best_loss, loss_val)
 
         loss.backward()
         optimizer.step()
+        apply_constraints(model)
 
-        lrs.append(optimizer.param_groups[0]['lr'])
-        losses.append(loss.item())
+        lrs.append(param_group['lr'])
+        losses.append(loss_val)
+        param_group['lr'] *= mult
 
-        optimizer.param_groups[0]['lr'] *= mult
+    loss_grads = np.gradient(losses)
 
-    # Automated extraction
-    loss_gradients = np.gradient(losses)
+    # First index (after a 5-step warm-up) where the loss gradient turns
+    # positive: the loss starts climbing again and noise dominates.
+    rising = np.flatnonzero(loss_grads[5:] > 0)
+    noise_idx = int(rising[0]) + 5 if rising.size else len(losses) - 1
 
-    # Find the first point (after a short warm-up of 5 steps) where the loss
-    # curve's gradient turns positive: this is where noise starts to
-    # dominate the LR sweep and the loss begins climbing again.
-    first_min_idx = len(losses) - 1
-    for i in range(5, len(loss_gradients)):
-        if loss_gradients[i] > 0:
-            first_min_idx = i
-            break
-
-    # The optimal LR is taken at the steepest descent *before* that point,
-    # i.e. where the loss was falling fastest while still in the
-    # signal-dominated (pre-noise) regime.
-    if first_min_idx < 2:
-        steepest_idx = 0
-    else:
-        steepest_idx = np.argmin(loss_gradients[:first_min_idx])
+    # Steepest descent before the noise onset (signal-dominated regime).
+    steepest_idx = 0 if noise_idx < 2 else int(np.argmin(loss_grads[:noise_idx]))
 
     optimal_lr = lrs[steepest_idx]
+    optimal_loss = losses[steepest_idx]
 
     # Restore the model/optimizer exactly as they were before the sweep.
     model.load_state_dict(initial_state)
     optimizer.load_state_dict(initial_optim)
 
     if plot_result:
-        plt.figure(figsize=(8, 5))
-        plt.plot(lrs, losses, label='Raw Loss', color='blue')
-        plt.scatter(
-            optimal_lr, losses[steepest_idx], color='red', s=50, zorder=5, label=f'Optimal LR: {optimal_lr:.2e}'
-        )
-        plt.scatter(
-            lrs[first_min_idx],
-            losses[first_min_idx],
-            color='orange',
-            s=50,
-            zorder=4,
-            label='First Minimum (Noise Start)',
-            marker='X',
-        )
-
-        plt.xscale('log')
-        plt.xlabel('Learning Rate')
-        plt.ylabel('Loss (MSE)')
-        plt.title('Learning Rate Finder (Pre-Noise Steepest Descent)')
-        plt.grid(True, which="both", ls="--", alpha=0.5)
-        plt.legend()
-        plt.show()
+        _plot_lr_finder(lrs, losses, optimal_lr, optimal_loss, noise_idx)
 
     return optimal_lr
 
 
-def reinitialize_model_parameters(processor, current_2pi: float) -> None:
+def reinitialize_model_parameters(model, current_2pi: float) -> None:
     """Reinitializes photonic processor static phases randomly in [0, 2π) and resets
     the cross-talk matrix to ideal diagonal coupling, applying structural masks.
+    Sigma is set to π/4 everywhere.
     """
     with torch.no_grad():
         # Random uniform phases in [0, 2π) to explore diverse basins
-        random_phases = torch.rand(processor.n_phases, dtype=processor.static_phases.dtype) * 2 * torch.pi
-        processor.static_phases.copy_(random_phases)
+        random_phases = torch.rand(model.n_phases, dtype=model.static_phases.dtype) * 2 * torch.pi
+        model.static_phases.copy_(random_phases)
 
         # Reset cross-talk matrix to ideal (diagonal-only) scaled to produces a 2*pi phase shift with `current_2pi`
         ideal_xtalk = torch.eye(
-            processor.n_phases,
-            dtype=processor.xtalk.dtype,
-            device=processor.xtalk.device,
+            model.n_phases,
+            dtype=model.xtalk.dtype,
+            device=model.xtalk.device,
         )
-        processor.xtalk.copy_(ideal_xtalk)
-        processor.xtalk.mul_(2 * torch.pi / (current_2pi**2))
+        model.xtalk.copy_(ideal_xtalk)
+        model.xtalk.mul_(2 * torch.pi / (current_2pi**2))
+
+        # Set sigma to π/4
+        model.sigma.fill_(torch.pi / 4)
+        if model.train_bs:
+            model.sigma.requires_grad = False
 
         # Mask the output
-        processor.static_phases.mul_(processor.static_phases_mask)
-        processor.xtalk.mul_(processor.xtalk_mask)
+        model.static_phases.mul_(model.static_phases_mask)
+        model.xtalk.mul_(model.xtalk_mask)
 
-        if processor.nonlinear:
-            processor.nl_factor.zero_()
-            processor.nl_factor.requires_grad = False
+        if model.nonlinear:
+            model.nl_factor.zero_()
+            model.nl_factor.requires_grad = False
+
 
 
 class CrosstalkManager:
@@ -214,12 +259,13 @@ class Trainer:
         self.init_optimizer(lr=1e-7)
 
     def init_optimizer(self, lr: float):
+        self.optimizer.state.clear() # TODO this was not present in original pipeline, just in escape sequence. CHECK!!!
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer, factor=self.config.lr_scheduler_factor, patience=self.config.lr_scheduler_patience
         )
 
-    def train_one_epoch(self, i_train, u_mag_train) -> float:
+    def train_one_epoch(self, i_train, u_train) -> float:
         if self.optimizer is None or self.scheduler is None:
             raise ValueError(
                 "Set the optimizer and scheduler before proceeding with training:\n",
@@ -230,17 +276,18 @@ class Trainer:
         self.optimizer.zero_grad()
 
         pred = self.model(i_train)
-        loss = self.criterion(pred, u_mag_train)
+        loss = self.criterion(pred, u_train)
 
         loss.backward()
         self.optimizer.step()
         self.scheduler.step(loss.detach())
+        apply_constraints(calib_model)
 
         return loss.item()
 
     def evaluate(self, i_test, u_test) -> float:
         self.model.eval()
-        with torch.inference_mode():
+        with torch.no_grad():
             pred_test = self.model(i_test)
             fid = amplitude_fidelity(u_test, pred_test).mean().item()
         return fid
@@ -287,6 +334,7 @@ class TrainingPipeline:
         epochs_no_improve = 0
         escape_attempts = 0
         nl_unfrozen = False
+        sigma_unfrozen = False
         old_epoch = current_epoch
 
         start_time = time.perf_counter()
@@ -319,10 +367,17 @@ class TrainingPipeline:
                 if fid_test >= self.config.target_fidelity:
                     return True, current_epoch - old_epoch
 
+                # Curriculum learning: non-linear factor
                 if self.trainer.model.nonlinear and fid_test > 0.99 and not nl_unfrozen:
-                    print("fidelity reached. Unfreezing nl_factor.")
+                    print("Fidelity reached 99%. Unfreezing nl_factor.")
                     self.trainer.model.nl_factor.requires_grad = True
                     nl_unfrozen = True
+
+                # Curriculum learning: unbalanced beam splitters
+                if self.trainer.model.learn_bs and fid_test > 0.98 and not sigma_unfrozen:
+                    print("Fidelity reached 98%. Unfreezing Beam Splitter learning.")
+                    self.trainer.model.sigma.requires_grad = True
+                    sigma_unfrozen = True
 
                 # Save best weights globally
                 if fid_test > self.best_overall_fidelity:
