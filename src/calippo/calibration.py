@@ -504,3 +504,5 @@ if __name__ == "__main__":
     # plot_training_history(pipeline.history, cfg.target_fidelity, path="training_history.png")
 
     processor.export_calibration("calibration_trained.pkl", state_dict=pipeline.best_weights)
+
+    # TODO: check if traning config is really necessary, unpack all data
