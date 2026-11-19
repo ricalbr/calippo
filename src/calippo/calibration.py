@@ -22,14 +22,14 @@ class TrainingConfig:
     # Multi-Start Params
     train_ratio: float = 0.8
     num_starts: int = 10
-    target_fidelity: float = 1 - 1e-4
+    target_fidelity: float = 0.9999
     max_global_epochs: int = 1_000_000
     check_interval: int = 100
 
     # Stagnation & Escape Params
     escape_patience: int = 300
     max_escape_attempts: int = 5
-    min_loss_delta: float = 1e-5
+    min_loss_delta: float = 1e-7
 
     # Optimization
     initial_lr: float = 1e-7
