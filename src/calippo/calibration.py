@@ -8,8 +8,10 @@ from dataclasses import dataclass
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import pickle
+import math
 
-from calippo.tools import amplitude_fidelity, sinkhorn
+from calippo.tools import amplitude_fidelity, sinkhorn, make_real_border
 
 
 @dataclass
@@ -21,7 +23,7 @@ class TrainingConfig:
     num_starts: int = 10
     target_fidelity: float = 0.9999
     max_global_epochs: int = 1_000_000
-    check_interval: int = 100
+    check_interval: int = 250
 
     # Stagnation & Escape Params
     escape_patience: int = 300
@@ -31,7 +33,7 @@ class TrainingConfig:
     # Optimization
     initial_lr: float = 1e-7
     lr_scheduler_patience: int = 100
-    lr_scheduler_factor: float = 0.25
+    lr_scheduler_factor: float = 0.5
 
 
 # fmt: off
@@ -72,8 +74,8 @@ sign_data = [
 
 def apply_constraints(model):
     with torch.no_grad():
-        model.mesh.xtalk.data = model.mesh.xtalk.abs() * torch.from_numpy(np.array(sign_data))
-        model.mesh.nl_factor.data = model.mesh.nl_factor.abs()
+        model.xtalk.data = model.xtalk.abs() * torch.from_numpy(np.array(sign_data))
+        model.nl_factor.data = model.nl_factor.abs()
 
 
 def _plot_lr_finder(lrs, losses, optimal_lr, optimal_loss, noise_idx):
@@ -194,8 +196,8 @@ def reinitialize_model_parameters(model, current_2pi: float) -> None:
         # Reset cross-talk matrix to ideal (diagonal-only) scaled to produces a 2*pi phase shift with `current_2pi`
         ideal_xtalk = torch.eye(
             model.n_phases,
-            dtype=model.xtalk.dtype,
-            device=model.xtalk.device,
+            dtype=torch.float64,
+            # device=model.xtalk.device,
         )
         model.xtalk.copy_(ideal_xtalk)
         model.xtalk.mul_(2 * torch.pi / (current_2pi**2))
@@ -211,7 +213,7 @@ def reinitialize_model_parameters(model, current_2pi: float) -> None:
             model.sigma.requires_grad = False
 
         # Reset non-linear factor
-        if model.nonlinear:
+        if model.non_linear:
             model.nl_factor.zero_()
             model.nl_factor.requires_grad = False
 
@@ -255,7 +257,7 @@ class CrosstalkManager:
             sp_mask = bad_diag_mask & model.static_phases_mask.bool()
             num_bad = sp_mask.sum().item()
             if num_bad > 0:
-                model.static_phases[sp_mask] = torch.rand(num_bad, device=model.static_phases.device) * 2 * torch.pi
+                model.static_phases[sp_mask] = torch.rand(num_bad, dtype=torch.float64) * 2 * torch.pi
 
 
 class Trainer:
@@ -270,8 +272,8 @@ class Trainer:
         self.init_optimizer(lr=1e-7)
 
     def init_optimizer(self, lr: float):
-        self.optimizer.state.clear()  # TODO this was not present in original pipeline, just in escape sequence. CHECK!!!
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
+        self.optimizer.state.clear()
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer, factor=self.config.lr_scheduler_factor, patience=self.config.lr_scheduler_patience
         )
@@ -292,7 +294,7 @@ class Trainer:
         loss.backward()
         self.optimizer.step()
         self.scheduler.step(loss.detach())
-        apply_constraints(calib_model)
+        apply_constraints(self.model)
 
         return loss.item()
 
@@ -367,13 +369,14 @@ class TrainingPipeline:
                 elapsed_time = current_time - start_time
                 start_time = current_time
 
+                fid_train = self.trainer.evaluate(i_train, u_train)
                 fid_test = self.trainer.evaluate(i_test, u_test)
                 print(
-                    f"Global Epoch {current_epoch:6d} |",
-                    f"LR: {self.trainer.optimizer.param_groups[0]['lr']:.2e} |",
-                    # f"Train Fid: {self.trainer.optimizer.lr:.5f} |",
-                    f"Test Fid: {fid_test:.5f} |",
-                    f"Loss: {loss:.2e} |",
+                    f"Global Epoch {current_epoch:8d} | ",
+                    f"LR: {self.trainer.optimizer.param_groups[0]['lr']:.2e} | ",
+                    f"Train Fid: {fid_train:.5f} | ",
+                    f"Test Fid: {fid_test:.5f} | ",
+                    f"Loss: {loss:.2e} | ",
                     f"Elapsed time: {elapsed_time:.2f} s",
                 )
 
@@ -381,13 +384,13 @@ class TrainingPipeline:
                     return True, current_epoch - old_epoch
 
                 # Curriculum learning: non-linear factor
-                if self.trainer.model.nonlinear and fid_test > 0.99 and nl_frozen:
+                if self.trainer.model.non_linear and fid_test > 0.99 and nl_frozen:
                     print("Fidelity reached 99%. Unfreezing non-linear factor.")
                     self.trainer.model.nl_factor.requires_grad = True
                     nl_frozen = False
 
                 # Curriculum learning: unbalanced beam splitters
-                if self.trainer.model.learn_bs and fid_test > 0.98 and sigma_frozen:
+                if self.trainer.model.unbalanced_beam_splitters and fid_test > 0.98 and sigma_frozen:
                     print("Fidelity reached 98%. Unfreezing Beam Splitter learning.")
                     self.trainer.model.sigma.requires_grad = True
                     sigma_frozen = False
@@ -442,12 +445,14 @@ def load_data(
         A tuple containing the currents and processed U_measured tensors.
     """
     print(f"Loading external experimental data from {data_filepath}...")
+    with open(data_filepath, "rb") as f:
+        data = pickle.load(f)
+        u_th = data["u_the"].transpose(1, 2)
+        u_exp = data["u_exp"].transpose(1, 2)
+        currents = data["currents"]
 
-    data = np.load(data_filepath)
-    currents = torch.from_numpy(data["currents"]).float()
-    u_exp = torch.from_numpy(data["u_exp"])
-    u_exp = torch.sqrt(sinkhorn(u_exp)[0])
-
+    u_th, *_ = make_real_border(u_th)
+    u_exp = torch.sqrt(sinkhorn(u_exp)[0]).abs()
     return split_train_test(currents, u_exp, train_ratio=train_ratio)
 
 
@@ -505,7 +510,7 @@ if __name__ == "__main__":
 
     # Data Loading
     train_bundle, test_bundle = load_data(
-        data_filepath="20250626_dataset.npy.npz",
+        data_filepath="20261117_PIC6810.pkl",
         train_ratio=cfg.train_ratio,
     )
 
