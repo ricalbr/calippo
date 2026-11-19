@@ -20,8 +20,8 @@ class TrainingConfig:
     # Multi-Start Params
     train_ratio: float = 0.8
     current_2pi: float = 10.0
-    num_starts: int = 10
     target_fidelity: float = 0.9999
+    num_starts: int = 10
     max_global_epochs: int = 1_000_000
     check_interval: int = 250
 
@@ -32,8 +32,8 @@ class TrainingConfig:
 
     # Optimization
     initial_lr: float = 1e-7
-    lr_scheduler_patience: int = 100
-    lr_scheduler_factor: float = 0.05
+    lr_scheduler_patience: int = 200
+    lr_scheduler_factor: float = 0.5
 
 
 # fmt: off
@@ -397,13 +397,13 @@ class TrainingPipeline:
 
                 # Curriculum learning: non-linear factor
                 if self.trainer.model.non_linear and fid_test > 0.99 and nl_frozen:
-                    print("Fidelity reached 99%. Unfreezing non-linear factor.")
+                    print("[ FID > 0.99 ] - Unfreezing phase shifters non-linear factors learning.")
                     self.trainer.model.nl_factor.requires_grad = True
                     nl_frozen = False
 
                 # Curriculum learning: unbalanced beam splitters
                 if self.trainer.model.unbalanced_beam_splitters and fid_test > 0.98 and sigma_frozen:
-                    print("Fidelity reached 98%. Unfreezing Beam Splitter learning.")
+                    print("[ FID > 0.98 ] - Unfreezing splitting ratios learning.")
                     self.trainer.model.sigma.requires_grad = True
                     sigma_frozen = False
 
