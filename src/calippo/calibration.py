@@ -17,7 +17,9 @@ from calippo.tools import amplitude_fidelity, sinkhorn
 class TrainingConfig:
     # Mesh Params
     n_modes: int = 6
-    current_2pi: float = 17.0
+    current_2pi: float = 10.0
+    non_linear: bool = False
+    unbalanced_bs: bool = True
 
     # Multi-Start Params
     train_ratio: float = 0.8
@@ -286,7 +288,8 @@ class TrainingPipeline:
         best_loss_this_start = float('inf')
         epochs_no_improve = 0
         escape_attempts = 0
-        nl_unfrozen = False
+        nl_frozen = True
+        sigma_frozen = True
         old_epoch = current_epoch
 
         start_time = time.perf_counter()
@@ -319,10 +322,10 @@ class TrainingPipeline:
                 if fid_test >= self.config.target_fidelity:
                     return True, current_epoch - old_epoch
 
-                if self.trainer.model.nonlinear and fid_test > 0.99 and not nl_unfrozen:
+                if self.trainer.model.nonlinear and fid_test > 0.99 and nl_frozen:
                     print("fidelity reached. Unfreezing nl_factor.")
                     self.trainer.model.nl_factor.requires_grad = True
-                    nl_unfrozen = True
+                    nl_frozen = False
 
                 # Save best weights globally
                 if fid_test > self.best_overall_fidelity:
