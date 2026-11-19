@@ -34,7 +34,6 @@ import scipy as sp
 import torch
 
 
-
 class Mesh(torch.nn.Module, ABC):
     """
     Abstract base class for UPP meshes.
