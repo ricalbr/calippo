@@ -415,7 +415,7 @@ class TrainingPipeline:
             # Escape Logic
             if epochs_no_improve >= self.config.escape_patience:
                 if escape_attempts >= self.config.max_escape_attempts:
-                    print("Max escape attempts reached. Abandoning start.")
+                    print("Max escape attempts reached. Abandoning start.\n")
                     return False, current_epoch - old_epoch
 
                 # Check cross-talk matrix
@@ -432,7 +432,7 @@ class TrainingPipeline:
                     print(f"XT FIX [{escape_attempts}/{self.config.max_escape_attempts}] -",
                           f"Found {torch.sum(bad_diag) + torch.sum(bad_off)} ill-elements in cross-talk matrix.")
                 else:
-                    print("Stagnation detected but no anomalies found. Moving to next start.")
+                    print("Stagnation detected but no anomalies found. Moving to next start.\n")
                     return False, current_epoch - old_epoch
 
         return False, current_epoch - old_epoch
