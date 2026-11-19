@@ -12,17 +12,12 @@ import torch
 from calippo.tools import amplitude_fidelity, sinkhorn
 
 
-# CONFIGURATION
 @dataclass
 class TrainingConfig:
-    # Mesh Params
-    n_modes: int = 6
-    current_2pi: float = 10.0
-    non_linear: bool = False
-    unbalanced_bs: bool = True
 
     # Multi-Start Params
     train_ratio: float = 0.8
+    current_2pi: float = 10.0
     num_starts: int = 10
     target_fidelity: float = 0.9999
     max_global_epochs: int = 1_000_000
@@ -39,6 +34,7 @@ class TrainingConfig:
     lr_scheduler_factor: float = 0.25
 
 
+# fmt: off
 sign_data = [
     [1, -1, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
     [1, 1, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
@@ -71,6 +67,8 @@ sign_data = [
     [0, 0, 0, 1, 1, 1, 1, -1, 1, -1, 1, -1, -1, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, -1, 1, -1],
     [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1],
 ]
+# fmt: on
+
 
 def apply_constraints(model):
     with torch.no_grad():
@@ -83,12 +81,21 @@ def _plot_lr_finder(lrs, losses, optimal_lr, optimal_loss, noise_idx):
     plt.figure(figsize=(8, 5))
     plt.plot(lrs, losses, label='Raw Loss', color='blue')
     plt.scatter(
-        optimal_lr, optimal_loss, color='red', s=50, zorder=5,
+        optimal_lr,
+        optimal_loss,
+        color='red',
+        s=50,
+        zorder=5,
         label=f'Optimal LR: {optimal_lr:.2e}',
     )
     plt.scatter(
-        lrs[noise_idx], losses[noise_idx], color='orange', s=50, zorder=4,
-        label='First Minimum (Noise Start)', marker='X',
+        lrs[noise_idx],
+        losses[noise_idx],
+        color='orange',
+        s=50,
+        zorder=4,
+        label='First Minimum (Noise Start)',
+        marker='X',
     )
     plt.xscale('log')
     plt.xlabel('Learning Rate')
@@ -165,6 +172,7 @@ def lr_finder(
 
     # Restore the model/optimizer exactly as they were before the sweep.
     model.load_state_dict(initial_state)
+    model.M = model._compute_mixing_layer()
     optimizer.load_state_dict(initial_optim)
 
     if plot_result:
@@ -192,19 +200,20 @@ def reinitialize_model_parameters(model, current_2pi: float) -> None:
         model.xtalk.copy_(ideal_xtalk)
         model.xtalk.mul_(2 * torch.pi / (current_2pi**2))
 
-        # Set sigma to π/4
-        model.sigma.fill_(torch.pi / 4)
-        if model.train_bs:
-            model.sigma.requires_grad = False
-
         # Mask the output
         model.static_phases.mul_(model.static_phases_mask)
         model.xtalk.mul_(model.xtalk_mask)
 
+        # Reset all beam splitters to π/4
+        model.sigma.fill_(torch.pi / 4)
+        model.M = model._compute_mixing_layer()
+        if model.unbalanced_beam_splitters:
+            model.sigma.requires_grad = False
+
+        # Reset non-linear factor
         if model.nonlinear:
             model.nl_factor.zero_()
             model.nl_factor.requires_grad = False
-
 
 
 class CrosstalkManager:
@@ -261,7 +270,7 @@ class Trainer:
         self.init_optimizer(lr=1e-7)
 
     def init_optimizer(self, lr: float):
-        self.optimizer.state.clear() # TODO this was not present in original pipeline, just in escape sequence. CHECK!!!
+        self.optimizer.state.clear()  # TODO this was not present in original pipeline, just in escape sequence. CHECK!!!
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer, factor=self.config.lr_scheduler_factor, patience=self.config.lr_scheduler_patience
@@ -326,7 +335,9 @@ class TrainingPipeline:
                     break
 
                 # Re-init and Find LR
-                opt_lr = lr_finder(self.trainer.model, self.trainer.optimizer, self.trainer.criterion, i_train, u_mag_train)
+                opt_lr = lr_finder(
+                    self.trainer.model, self.trainer.optimizer, self.trainer.criterion, i_train, u_mag_train
+                )
                 reinitialize_model_parameters(self.trainer.model, self.config.current_2pi)
                 self.trainer.init_optimizer(opt_lr)
             break
@@ -486,7 +497,11 @@ if __name__ == "__main__":
     cfg = TrainingConfig()
 
     # Initial Setup
-    processor = Clements(n_modes=cfg.n_modes, nonlinear=True)
+    processor = Clements(
+        n_modes=6,
+        non_linear=False,
+        unbalanced_beam_splitters=True,
+    )
 
     # Data Loading
     train_bundle, test_bundle = load_data(
