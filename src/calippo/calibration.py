@@ -33,7 +33,7 @@ class TrainingConfig:
     # Optimization
     initial_lr: float = 1e-7
     lr_scheduler_patience: int = 100
-    lr_scheduler_factor: float = 0.5
+    lr_scheduler_factor: float = 0.05
 
 
 # fmt: off
@@ -314,21 +314,28 @@ class TrainingPipeline:
         self.best_weights = None
 
     def run_multi_start(self, train_data, test_data):
-        i_train, u_mag_train, _ = train_data
+        i_train, u_train, _ = train_data
         i_test, _, u_test = test_data
 
         # Re-init and Find LR
         reinitialize_model_parameters(self.trainer.model, self.config.current_2pi)
-        opt_lr = lr_finder(self.trainer.model, self.trainer.optimizer, self.trainer.criterion, i_train, u_mag_train)
+        opt_lr = lr_finder(
+            model=self.trainer.model,
+            optimizer=self.trainer.optimizer,
+            criterion=self.trainer.criterion,
+            i_train=i_train,
+            u_target_train=u_train,
+        )
         self.trainer.init_optimizer(opt_lr)
 
         global_epoch = 0
         while global_epoch < self.config.max_global_epochs:
             for start_idx in range(self.config.num_starts):
                 print(f" START {start_idx + 1}/{self.config.num_starts} ".center(100, '-'))
+
                 # Start Training Loop
                 success, epochs_spent = self._execute_start(
-                    i_train, u_mag_train, i_test, u_test, opt_lr, current_epoch=global_epoch
+                    i_train, u_train, i_test, u_test, opt_lr, current_epoch=global_epoch
                 )
                 global_epoch += epochs_spent
 
@@ -337,14 +344,19 @@ class TrainingPipeline:
                     break
 
                 # Re-init and Find LR
-                opt_lr = lr_finder(
-                    self.trainer.model, self.trainer.optimizer, self.trainer.criterion, i_train, u_mag_train
-                )
                 reinitialize_model_parameters(self.trainer.model, self.config.current_2pi)
+                opt_lr = lr_finder(
+                    model=self.trainer.model,
+                    optimizer=self.trainer.optimizer,
+                    criterion=self.trainer.criterion,
+                    i_train=i_train,
+                    u_target_train=u_train,
+                    plot_result=False,
+                )
                 self.trainer.init_optimizer(opt_lr)
             break
 
-    def _execute_start(self, i_train, u_mag_train, i_test, u_test, opt_lr, current_epoch) -> tuple[bool, int]:
+    def _execute_start(self, i_train, u_train, i_test, u_test, opt_lr, current_epoch) -> tuple[bool, int]:
         best_loss_this_start = float('inf')
         epochs_no_improve = 0
         escape_attempts = 0
@@ -355,7 +367,7 @@ class TrainingPipeline:
         start_time = time.perf_counter()
         while current_epoch < self.config.max_global_epochs:
             current_epoch += 1
-            loss = self.trainer.train_one_epoch(i_train, u_mag_train)
+            loss = self.trainer.train_one_epoch(i_train, u_train)
 
             # Stagnation Tracking
             if loss < best_loss_this_start - self.config.min_loss_delta:
@@ -525,6 +537,6 @@ if __name__ == "__main__":
     # TODO: add visualization, model export
     # plot_training_history(pipeline.history, cfg.target_fidelity, path="training_history.png")
 
-    processor.export_calibration("calibration_trained.pkl", state_dict=pipeline.best_weights)
+    processor.export_calibration("000calibration_trained.pkl", state_dict=pipeline.best_weights)
 
     # TODO: check if traning config is really necessary, unpack all data
