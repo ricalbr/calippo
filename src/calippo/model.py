@@ -98,13 +98,20 @@ class Mesh(torch.nn.Module, ABC):
         self.nl_factor = torch.nn.Parameter(torch.from_numpy(nl_np).float())
 
         # Output
-        msg = (
-            "A new processor was created.\n"
-            + f"This has {self.n_modes} modes, {self.n_phases} tunable phases.\n"
-            + f"Only {self.n_used_phases} phases are actually used.\n"
-            + f"Non-linear model: {'Enabled' if self.nonlinear else 'Disabled'}\n",
-        )
-        print(*msg)
+        on = lambda flag: "Enabled" if flag else "Disabled"
+        rows = [
+            ("Modes", self.n_modes),
+            ("Phases", f"{self.n_phases} tunable, {self.n_used_phases} used"),
+            ("Calibration", "none" or self.calibration_file),
+            ("Unbalanced BS", on(self.unbalanced_beam_splitters)),
+            ("Non-linear", on(self.non_linear)),
+            ("Dtype", self.sigma.dtype),
+            ("Device", self.sigma.device),
+        ]
+        width = max(len(label) for label, _ in rows)
+        print(" PROCESSOR MODEL SUMMARY ".center(40, "-"))
+        for label, value in rows:
+            print(f"{label:<{width}} : {value}")
 
     @abstractmethod
     def _generate_masks(self) -> tuple[nparray, nparray]:
