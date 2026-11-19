@@ -372,11 +372,11 @@ class TrainingPipeline:
                 fid_train = self.trainer.evaluate(i_train, u_train)
                 fid_test = self.trainer.evaluate(i_test, u_test)
                 print(
-                    f"Global Epoch {current_epoch:8d} | ",
-                    f"LR: {self.trainer.optimizer.param_groups[0]['lr']:.2e} | ",
-                    f"Train Fid: {fid_train:.5f} | ",
-                    f"Test Fid: {fid_test:.5f} | ",
-                    f"Loss: {loss:.2e} | ",
+                    f"Global Epoch {current_epoch:8d} |",
+                    f"LR: {self.trainer.optimizer.param_groups[0]['lr']:.2e} |",
+                    f"Train Fid: {fid_train:.5f} |",
+                    f"Test Fid: {fid_test:.5f} |",
+                    f"Loss: {loss:.2e} |",
                     f"Elapsed time: {elapsed_time:.2f} s",
                 )
 
