@@ -429,8 +429,8 @@ class TrainingPipeline:
                     self.trainer.init_optimizer(opt_lr)
                     epochs_no_improve = 0
 
-                    print(f"Update cross-talk matrix. Found {torch.sum(bad_diag) + torch.sum(bad_off)} ill-elements.")
-                    print(f"Targeted Escape {escape_attempts}/{self.config.max_escape_attempts} applied.")
+                    print(f"XT FIX [{escape_attempts}/{self.config.max_escape_attempts}] -",
+                          f"Found {torch.sum(bad_diag) + torch.sum(bad_off)} ill-elements in cross-talk matrix.")
                 else:
                     print("Stagnation detected but no anomalies found. Moving to next start.")
                     return False, current_epoch - old_epoch
@@ -510,19 +510,18 @@ def split_train_test(
 if __name__ == "__main__":
     from calippo.model import Clements
 
-    # Mesh Params
-    cfg = TrainingConfig()
-
     # Initial Setup
     processor = Clements(
         n_modes=6,
         non_linear=False,
         unbalanced_beam_splitters=True,
     )
+    cfg = TrainingConfig()
+    datapath = "20261117_PIC6810.pkl"
 
     # Data Loading
     train_bundle, test_bundle = load_data(
-        data_filepath="20261117_PIC6810.pkl",
+        data_filepath=datapath,
         train_ratio=cfg.train_ratio,
     )
 
@@ -534,9 +533,11 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("Ctrl-C program interrupted.\n")
 
+    # Export best model weights
+    val = f"{pipeline.best_overall_fidelity:.4f}".replace('.', '-')
+    processor.export_calibration(f"cal_{str(datapath).split('_')[0]}_{val}.pkl", state_dict=pipeline.best_weights)
+
+    # TODO: check if traning config is really necessary, unpack all data
     # TODO: add visualization, model export
     # plot_training_history(pipeline.history, cfg.target_fidelity, path="training_history.png")
 
-    processor.export_calibration("000calibration_trained.pkl", state_dict=pipeline.best_weights)
-
-    # TODO: check if traning config is really necessary, unpack all data
