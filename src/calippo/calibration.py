@@ -525,7 +525,7 @@ def load_data(
 
     u_th, *_ = make_real_border(u_th)
     u_exp = torch.sqrt(sinkhorn(u_exp)[0]).abs()
-    print(f"Baseline fidelity before training: {amplitude_fidelity(u_th.abs(), u_exp).mean():.4f}.\n")
+    print(f"Fidelity baseline before training: {amplitude_fidelity(u_th.abs(), u_exp).mean():.4f}.\n")
 
     return (
         (currents[:n_train].to(device), u_exp[:n_train].to(device)),
