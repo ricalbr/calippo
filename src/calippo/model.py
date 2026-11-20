@@ -107,6 +107,7 @@ class Mesh(torch.nn.Module, ABC):
         print(" PROCESSOR MODEL SUMMARY ".center(40, "-"))
         for label, value in rows:
             print(f"{label:<{width}} : {value}")
+        print()
 
     @abstractmethod
     def _generate_masks(self) -> tuple[torch.Tensor, torch.Tensor]:
