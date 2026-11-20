@@ -1,17 +1,18 @@
 from __future__ import annotations
 
 import copy
+import math
 import pathlib
+import pickle
 import time
 from dataclasses import dataclass
+from typing import Callable
 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-import pickle
-import math
 
-from calippo.tools import amplitude_fidelity, sinkhorn, make_real_border
+from calippo.tools import amplitude_fidelity, make_real_border, sinkhorn
 
 
 @dataclass
@@ -27,7 +28,7 @@ class TrainingConfig:
 
     # Stagnation & Escape Params
     escape_patience: int = 500
-    max_escape_attempts: int = 5
+    max_escape_attempts: int = 10
     min_loss_delta: float = 1e-7
 
     # Optimization
@@ -87,6 +88,7 @@ def state_dict_to_cpu(model):
     sd = model.state_dict()
     return type(sd)((k, v.detach().cpu().clone()) for k, v in sd.items())
 
+
 def _plot_lr_finder(lrs, losses, optimal_lr, optimal_loss, noise_idx):
     """Plot the LR range test curve with the optimal and noise-onset points marked."""
     plt.figure(figsize=(8, 5))
@@ -118,7 +120,7 @@ def _plot_lr_finder(lrs, losses, optimal_lr, optimal_loss, noise_idx):
 
 
 def lr_finder(
-    model: nn.Module,
+    model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     criterion: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
     i_train: torch.Tensor,
@@ -239,7 +241,11 @@ class CrosstalkManager:
             diag_mask = model.xtalk_mask.diagonal().bool()
 
             valid_diag = diag[diag_mask]
-            mean_diag = valid_diag.abs().mean().clamp_min(1e-8) if valid_diag.numel() > 0 else torch.tensor(1e-8, device=diag.device)
+            mean_diag = (
+                valid_diag.abs().mean().clamp_min(1e-8)
+                if valid_diag.numel() > 0
+                else torch.tensor(1e-8, device=diag.device)
+            )
 
             # Diagonal: Deviating > 50% from mean
             diag_dev = (diag.abs() - mean_diag).abs() / mean_diag
@@ -266,7 +272,9 @@ class CrosstalkManager:
             sp_mask = bad_diag_mask & model.static_phases_mask.bool()
             num_bad = sp_mask.sum().item()
             if num_bad > 0:
-                model.static_phases[sp_mask] = torch.rand(num_bad, device=model.static_phases.device, dtype=torch.float64) * 2 * torch.pi
+                model.static_phases[sp_mask] = (
+                    torch.rand(num_bad, device=model.static_phases.device, dtype=torch.float64) * 2 * torch.pi
+                )
 
 
 class Trainer:
@@ -323,7 +331,7 @@ class TrainingPipeline:
         self.best_weights = None
 
     def run_multi_start(self, train_data, test_data):
-        i_train, u_train= train_data
+        i_train, u_train = train_data
         i_test, u_test = test_data
 
         # Re-init and Find LR
@@ -367,7 +375,7 @@ class TrainingPipeline:
                 self.trainer.init_optimizer(opt_lr)
             break
 
-    def _execute_start(self, i_train, u_train, i_test, u_test, opt_lr, current_epoch) -> tuple[bool, int]:
+    def _execute_start(self, i_train, u_train, i_test, u_test, opt_lr, current_epoch) -> tuple[bool, int, float]:
         best_loss_this_start = float('inf')
         best_fid_this_start = -1
         epochs_no_improve = 0
@@ -401,7 +409,7 @@ class TrainingPipeline:
                     f"Train Fid: {fid_train:.5f} |",
                     f"Test Fid: {fid_test:.5f} |",
                     f"Loss: {loss:.2e} |",
-                    f"Elapsed time: {elapsed_time:.2f} s",
+                    f"Time: {elapsed_time * 1000 /self.config.check_interval:.2f} ms/epoch",
                 )
 
                 if fid_test >= self.config.target_fidelity:
@@ -443,8 +451,10 @@ class TrainingPipeline:
                     self.trainer.init_optimizer(opt_lr)
                     epochs_no_improve = 0
 
-                    print(f"XT FIX [{escape_attempts}/{self.config.max_escape_attempts}] -",
-                          f"Found {torch.sum(bad_diag) + torch.sum(bad_off)} ill-elements in cross-talk matrix.")
+                    print(
+                        f"XT FIX [{escape_attempts}/{self.config.max_escape_attempts}] -",
+                        f"Found {torch.sum(bad_diag) + torch.sum(bad_off)} ill-elements in cross-talk matrix.",
+                    )
                 else:
                     print("Stagnation detected but no anomalies found. Moving to next start.\n")
                     return False, current_epoch - old_epoch, best_fid_this_start
@@ -499,7 +509,6 @@ def load_data(
     )
 
 
-
 if __name__ == "__main__":
     from calippo.model import Clements
     from calippo.tools import get_device
@@ -544,4 +553,3 @@ if __name__ == "__main__":
     # TODO: add visualization
     # plot_training_history(pipeline.history, cfg.target_fidelity, path="training_history.png")
     # load model, evaluate on test set and plot fidelity histogram
-

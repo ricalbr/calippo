@@ -32,6 +32,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import scipy as sp
 import torch
+
 from calippo.tools import get_device
 
 
@@ -280,7 +281,9 @@ class Mesh(torch.nn.Module, ABC):
         sigma = torch.pi / 4 * torch.ones(self.n_phases // 2, dtype=torch.float64, device=device)
 
         if self.unbalanced_beam_splitters:
-            sigma += 0.0125 * torch.pi * (torch.rand(self.n_phases // 2, device=device) - 0.5)  # BS as unbalanced as 45/55
+            sigma += (
+                0.0125 * torch.pi * (torch.rand(self.n_phases // 2, device=device) - 0.5)
+            )  # BS as unbalanced as 45/55
             # sigma += 0.0250 * torch.pi * (torch.rand(self.n_phases // 2, device=device) - 0.5)  # BS as unbalanced as 40/60
 
         return static_phases, xtalk, nl_factor, sigma
@@ -1527,9 +1530,10 @@ class Bell(Mesh):
 
 if __name__ == "__main__":
 
-    from calippo.tools import fidelity, get_haar_unitary, make_real_border
     import time
     import traceback
+
+    from calippo.tools import fidelity, get_haar_unitary, make_real_border
 
     processor = None
 
