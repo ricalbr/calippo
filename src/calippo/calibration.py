@@ -26,7 +26,7 @@ class TrainingConfig:
     check_interval: int = 250
 
     # Stagnation & Escape Params
-    escape_patience: int = 300
+    escape_patience: int = 500
     max_escape_attempts: int = 5
     min_loss_delta: float = 1e-7
 
@@ -314,8 +314,8 @@ class TrainingPipeline:
         self.best_weights = None
 
     def run_multi_start(self, train_data, test_data):
-        i_train, u_train, _ = train_data
-        i_test, _, u_test = test_data
+        i_train, u_train= train_data
+        i_test, u_test = test_data
 
         # Re-init and Find LR
         reinitialize_model_parameters(self.trainer.model, self.config.current_2pi)
@@ -331,10 +331,10 @@ class TrainingPipeline:
         global_epoch = 0
         while global_epoch < self.config.max_global_epochs:
             for start_idx in range(self.config.num_starts):
-                print(f" START {start_idx + 1}/{self.config.num_starts} ".center(100, '-'))
+                print(f" START {start_idx + 1}/{self.config.num_starts} ".center(120, '-'))
 
                 # Start Training Loop
-                success, epochs_spent = self._execute_start(
+                success, epochs_spent, best_fid = self._execute_start(
                     i_train, u_train, i_test, u_test, opt_lr, current_epoch=global_epoch
                 )
                 global_epoch += epochs_spent
@@ -342,6 +342,8 @@ class TrainingPipeline:
                 if success:
                     print(f"Target fidelity achieved in start {start_idx+1}!")
                     break
+                else:
+                    print(f" [EOS] Best achieved fidelity: {best_fid:.4f} ".center(120, '-'))
 
                 # Re-init and Find LR
                 reinitialize_model_parameters(self.trainer.model, self.config.current_2pi)
@@ -358,6 +360,7 @@ class TrainingPipeline:
 
     def _execute_start(self, i_train, u_train, i_test, u_test, opt_lr, current_epoch) -> tuple[bool, int]:
         best_loss_this_start = float('inf')
+        best_fid_this_start = -1
         epochs_no_improve = 0
         escape_attempts = 0
         nl_frozen = True
@@ -384,7 +387,7 @@ class TrainingPipeline:
                 fid_train = self.trainer.evaluate(i_train, u_train)
                 fid_test = self.trainer.evaluate(i_test, u_test)
                 print(
-                    f"Global Epoch {current_epoch:8d} |",
+                    f"Global Epoch {current_epoch:7d} |",
                     f"LR: {self.trainer.optimizer.param_groups[0]['lr']:.2e} |",
                     f"Train Fid: {fid_train:.5f} |",
                     f"Test Fid: {fid_test:.5f} |",
@@ -393,17 +396,19 @@ class TrainingPipeline:
                 )
 
                 if fid_test >= self.config.target_fidelity:
-                    return True, current_epoch - old_epoch
+                    return True, current_epoch - old_epoch, fid_test
+                if fid_test >= best_fid_this_start:
+                    best_fid_this_start = fid_test
 
                 # Curriculum learning: non-linear factor
                 if self.trainer.model.non_linear and fid_test > 0.99 and nl_frozen:
-                    print("[ FID > 0.99 ] - Unfreezing phase shifters non-linear factors learning.")
+                    print(" [ FID > 0.99 ] - Unfreezing phase shifters non-linear factors learning. ".center(120, '-'))
                     self.trainer.model.nl_factor.requires_grad = True
                     nl_frozen = False
 
                 # Curriculum learning: unbalanced beam splitters
                 if self.trainer.model.unbalanced_beam_splitters and fid_test > 0.98 and sigma_frozen:
-                    print("[ FID > 0.98 ] - Unfreezing splitting ratios learning.")
+                    print(" [ FID > 0.98 ] - Unfreezing splitting ratios learning. ".center(120, '-'))
                     self.trainer.model.sigma.requires_grad = True
                     sigma_frozen = False
 
@@ -416,7 +421,7 @@ class TrainingPipeline:
             if epochs_no_improve >= self.config.escape_patience:
                 if escape_attempts >= self.config.max_escape_attempts:
                     print("Max escape attempts reached. Abandoning start.\n")
-                    return False, current_epoch - old_epoch
+                    return False, current_epoch - old_epoch, best_fid_this_start
 
                 # Check cross-talk matrix
                 bad_diag, bad_off, mean_diag = CrosstalkManager.analyze_anomalies(self.trainer.model)
@@ -433,15 +438,15 @@ class TrainingPipeline:
                           f"Found {torch.sum(bad_diag) + torch.sum(bad_off)} ill-elements in cross-talk matrix.")
                 else:
                     print("Stagnation detected but no anomalies found. Moving to next start.\n")
-                    return False, current_epoch - old_epoch
+                    return False, current_epoch - old_epoch, best_fid_this_start
 
-        return False, current_epoch - old_epoch
+        return False, current_epoch - old_epoch, best_fid_this_start
 
 
 def load_data(
     data_filepath: str | pathlib.Path,
     train_ratio: float = 0.8,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]:
     """Load experimental data from disk.
 
     Parameters
@@ -454,57 +459,32 @@ def load_data(
     Returns
     -------
     tuple[torch.Tensor, torch.Tensor]
-        A tuple containing the currents and processed U_measured tensors.
+        A tuple containing the training and test data. Each subset is a triple of
+        PyTorch tensors containing the currents, processed ``U_raw``, and processed
+        ``U_measured``, respectively.
+        Order: (i_train, u_exp_train) and (i_test, u_exp_test)
     """
     print(f"Loading external experimental data from {data_filepath}...")
     with open(data_filepath, "rb") as f:
         data = pickle.load(f)
-        u_th = data["u_the"].transpose(1, 2)
+        u_th = data["u_the"]
         u_exp = data["u_exp"].transpose(1, 2)
         currents = data["currents"]
 
-    u_th, *_ = make_real_border(u_th)
-    u_exp = torch.sqrt(sinkhorn(u_exp)[0]).abs()
-    return split_train_test(currents, u_exp, train_ratio=train_ratio)
-
-
-def split_train_test(
-    currents: torch.Tensor,
-    u_exp: torch.Tensor,
-    train_ratio: float = 0.8,
-) -> tuple:
-    """Split data into training and test sets.
-
-    Parameters
-    ----------
-    currents : torch.Tensor
-        Input currents tensor.
-    u_exp : torch.Tensor
-        Processed U_measured tensor.
-    train_ratio : float, default=0.8
-        Fraction of the data to use for training.
-
-    Returns
-    -------
-    tuple
-        A tuple containing the training and test data. Each subset is a triple of
-        PyTorch tensors containing the currents, processed ``U_raw``, and processed
-        ``U_measured``, respectively.
-    """
-    # Amplitude matrix
-    u_mag_exp = torch.abs(u_exp)
-
-    # Dataset splitting
     total_samples = len(currents)
     n_train = int(total_samples * train_ratio)
     n_test = total_samples - n_train
+    print(f"Total Samples: {total_samples} (Train: {n_train}, Test: {n_test}).")
 
-    print(f"Total Samples: {total_samples} (Train: {n_train}, Test: {n_test})")
+    u_th, *_ = make_real_border(u_th)
+    u_exp = torch.sqrt(sinkhorn(u_exp)[0]).abs()
+    print(f"Baseline fidelity before training: {amplitude_fidelity(u_th.abs(), u_exp).mean():.4f}.\n")
 
     return (
-        (currents[:n_train], u_exp[:n_train], u_mag_exp[:n_train]),
-        (currents[n_train:], u_exp[n_train:], u_mag_exp[n_train:]),
+        (currents[:n_train], u_exp[:n_train]),
+        (currents[n_train:], u_exp[n_train:]),
     )
+
 
 
 if __name__ == "__main__":
@@ -534,10 +514,11 @@ if __name__ == "__main__":
         print("Ctrl-C program interrupted.\n")
 
     # Export best model weights
-    val = f"{pipeline.best_overall_fidelity:.4f}".replace('.', '-')
-    processor.export_calibration(f"cal_{str(datapath).split('_')[0]}_{val}.pkl", state_dict=pipeline.best_weights)
+    val = f"{pipeline.best_overall_fidelity:.4f}".replace('.', '_')
+    processor.export_calibration(f"{str(datapath).split('_')[0]}_F{val}.pkl", state_dict=pipeline.best_weights)
 
     # TODO: check if traning config is really necessary, unpack all data
-    # TODO: add visualization, model export
+    # TODO: add visualization
     # plot_training_history(pipeline.history, cfg.target_fidelity, path="training_history.png")
+    # load model, evaluate on test set and plot fidelity histogram
 
