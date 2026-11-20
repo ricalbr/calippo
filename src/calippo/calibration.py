@@ -73,10 +73,26 @@ sign_data = [
 # fmt: on
 
 
+
+_SIGN_CACHE: dict = {}
+
+
+def _xtalk_sign(model) -> torch.Tensor:
+    """Cross-talk sign pattern as a tensor living on the model's device (built once, reused every epoch)."""
+    key = (model.xtalk.device, model.xtalk.dtype)
+    sign = _SIGN_CACHE.get(key)
+    if sign is None:
+        sign = torch.tensor(sign_data, dtype=model.xtalk.dtype, device=model.xtalk.device)
+        _SIGN_CACHE[key] = sign
+    return sign
+
+
 def apply_constraints(model):
+    # in-line updates
     with torch.no_grad():
-        model.xtalk.data = model.xtalk.abs() * torch.tensor(np.array(sign_data), device=model.device)
-        model.nl_factor.data = model.nl_factor.abs()
+        model.xtalk.abs_().mul_(_xtalk_sign(model))
+        if model.non_linear:  # for a linear model nl_factor is identically zero
+            model.nl_factor.abs_()
 
 
 def state_dict_to_cpu(model):
@@ -235,6 +251,7 @@ class CrosstalkManager:
     @staticmethod
     def analyze_anomalies(model) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Returns masks for bad diagonal and bad off-diagonal entries."""
+
         with torch.no_grad():
             xt_active = model.xtalk * model.xtalk_mask
             diag = xt_active.diagonal().to(model.xtalk.device)
@@ -289,7 +306,13 @@ class Trainer:
         self.init_optimizer(lr=1e-7)
 
     def init_optimizer(self, lr: float):
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
+        params = list(self.model.parameters())
+        try:
+            # Fused Adam: one kernel for all parameters instead of several per parameter (CUDA only).
+            fused = {"fused": True} if self.model.device.type == "cuda" else {}
+            self.optimizer = torch.optim.Adam(params, lr=lr, **fused)
+        except (RuntimeError, ValueError):
+            self.optimizer = torch.optim.Adam(params, lr=lr)
         self.optimizer.state.clear()
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer, factor=self.config.lr_scheduler_factor, patience=self.config.lr_scheduler_patience
@@ -310,10 +333,11 @@ class Trainer:
 
         loss.backward()
         self.optimizer.step()
-        self.scheduler.step(loss.detach())
         apply_constraints(self.model)
 
-        return loss.item()
+        loss_val = loss.item()
+        self.scheduler.step(loss_val)
+        return loss_val
 
     def evaluate(self, i_test, u_test) -> float:
         self.model.eval()
@@ -404,12 +428,12 @@ class TrainingPipeline:
                 fid_train = self.trainer.evaluate(i_train, u_train)
                 fid_test = self.trainer.evaluate(i_test, u_test)
                 print(
-                    f"Global Epoch {current_epoch:7d} |",
+                    f" Global Epoch {current_epoch:7d} |",
                     f"LR: {self.trainer.optimizer.param_groups[0]['lr']:.2e} |",
                     f"Train Fid: {fid_train:.5f} |",
                     f"Test Fid: {fid_test:.5f} |",
                     f"Loss: {loss:.2e} |",
-                    f"Time: {elapsed_time * 1000 /self.config.check_interval:.2f} ms/epoch",
+                    f"Time/Epoch: {elapsed_time * 1000 /self.config.check_interval:3.2f} ms",
                 )
 
                 if fid_test >= self.config.target_fidelity:
