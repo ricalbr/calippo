@@ -74,9 +74,18 @@ sign_data = [
 
 def apply_constraints(model):
     with torch.no_grad():
-        model.xtalk.data = model.xtalk.abs() * torch.from_numpy(np.array(sign_data))
+        model.xtalk.data = model.xtalk.abs() * torch.tensor(np.array(sign_data), device=model.device)
         model.nl_factor.data = model.nl_factor.abs()
 
+
+def state_dict_to_cpu(model):
+    """
+    Detached CPU copy of the model state_dict. Keeping checkpoints on the CPU makes the saved pickle
+    loadable on machines without CUDA, and does not hold GPU memory. `load_state_dict` copies the
+    tensors back onto whatever device the model lives on.
+    """
+    sd = model.state_dict()
+    return type(sd)((k, v.detach().cpu().clone()) for k, v in sd.items())
 
 def _plot_lr_finder(lrs, losses, optimal_lr, optimal_loss, noise_idx):
     """Plot the LR range test curve with the optimal and noise-onset points marked."""
@@ -190,14 +199,14 @@ def reinitialize_model_parameters(model, current_2pi: float) -> None:
     """
     with torch.no_grad():
         # Random uniform phases in [0, 2π) to explore diverse basins
-        random_phases = torch.rand(model.n_phases, dtype=model.static_phases.dtype) * 2 * torch.pi
+        random_phases = torch.rand(model.n_phases, device=model.device, dtype=model.static_phases.dtype) * 2 * torch.pi
         model.static_phases.copy_(random_phases)
 
         # Reset cross-talk matrix to ideal (diagonal-only) scaled to produces a 2*pi phase shift with `current_2pi`
         ideal_xtalk = torch.eye(
             model.n_phases,
+            device=model.xtalk.device,
             dtype=torch.float64,
-            # device=model.xtalk.device,
         )
         model.xtalk.copy_(ideal_xtalk)
         model.xtalk.mul_(2 * torch.pi / (current_2pi**2))
@@ -226,11 +235,11 @@ class CrosstalkManager:
         """Returns masks for bad diagonal and bad off-diagonal entries."""
         with torch.no_grad():
             xt_active = model.xtalk * model.xtalk_mask
-            diag = xt_active.diagonal()
+            diag = xt_active.diagonal().to(model.xtalk.device)
             diag_mask = model.xtalk_mask.diagonal().bool()
 
             valid_diag = diag[diag_mask]
-            mean_diag = valid_diag.abs().mean().clamp_min(1e-8) if valid_diag.numel() > 0 else torch.tensor(1e-8)
+            mean_diag = valid_diag.abs().mean().clamp_min(1e-8) if valid_diag.numel() > 0 else torch.tensor(1e-8, device=diag.device)
 
             # Diagonal: Deviating > 50% from mean
             diag_dev = (diag.abs() - mean_diag).abs() / mean_diag
@@ -257,7 +266,7 @@ class CrosstalkManager:
             sp_mask = bad_diag_mask & model.static_phases_mask.bool()
             num_bad = sp_mask.sum().item()
             if num_bad > 0:
-                model.static_phases[sp_mask] = torch.rand(num_bad, dtype=torch.float64) * 2 * torch.pi
+                model.static_phases[sp_mask] = torch.rand(num_bad, device=model.static_phases.device, dtype=torch.float64) * 2 * torch.pi
 
 
 class Trainer:
@@ -446,6 +455,7 @@ class TrainingPipeline:
 def load_data(
     data_filepath: str | pathlib.Path,
     train_ratio: float = 0.8,
+    device: str | torch.device | None = None,
 ) -> tuple[tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]:
     """Load experimental data from disk.
 
@@ -455,6 +465,9 @@ def load_data(
         Path to the file containing the experimental data.
     train_ratio : float, default=0.8
         Fraction of the data to use for training.
+    device : str or torch.device, optional
+        Device on which parameters and buffers are stored. If None (default),
+        CUDA is used when available, otherwise the CPU.
 
     Returns
     -------
@@ -481,20 +494,29 @@ def load_data(
     print(f"Baseline fidelity before training: {amplitude_fidelity(u_th.abs(), u_exp).mean():.4f}.\n")
 
     return (
-        (currents[:n_train], u_exp[:n_train]),
-        (currents[n_train:], u_exp[n_train:]),
+        (currents[:n_train].to(device), u_exp[:n_train].to(device)),
+        (currents[n_train:].to(device), u_exp[n_train:].to(device)),
     )
 
 
 
 if __name__ == "__main__":
     from calippo.model import Clements
+    from calippo.tools import get_device
 
-    # Initial Setup
+    # Use the GPU if CUDA is available, otherwise fall back to the CPU
+    device = get_device()
+    if device.type == "cuda":
+        print(f"Using device: {device} ({torch.cuda.get_device_name(device)})")
+    else:
+        print(f"Using device: {device}")
+
+    # Setup
     processor = Clements(
         n_modes=6,
         non_linear=False,
         unbalanced_beam_splitters=True,
+        device=device,
     )
     cfg = TrainingConfig()
     datapath = "20261117_PIC6810.pkl"
@@ -503,6 +525,7 @@ if __name__ == "__main__":
     train_bundle, test_bundle = load_data(
         data_filepath=datapath,
         train_ratio=cfg.train_ratio,
+        device=device,
     )
 
     # Training

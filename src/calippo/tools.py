@@ -1,35 +1,39 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-Created on Sat Nov  8 12:07:46 2025
-
-@author: Francesco Ceccarelli, Andrea Crespi
-
 Utilities and helpers for UPP calibration/operation.
 
 This module provides utility functions for measuring and processing unitaries
 on a Universal Photonic Processor (UPP), including Sinkhorn normalization,
 fidelity metrics, random unitary generation and other. PyTorch tensor-based
 implementation supporting batched operations.
-
-Functions
----------
-sinkhorn(U, tol=1e-3, max_iter=1000)
-    Normalize tensors to be doubly stochastic using Sinkhorn-Knopp.
-amplitude_fidelity(U_target, U_exp)
-    Calculate fidelity based on the magnitude of tensor elements.
-fidelity(U_target, U_exp)
-    Calculate the standard fidelity for complex unitaries.
-make_real_border(U)
-    Make a unitary tensor "real-bordered" by zeroing angles on 1st row/col.
-get_haar_unitary(size, batch_size=1)
-    Generate a complex random Haar-distributed unitary tensor or batch.
 """
 
 from typing import Optional, Tuple
 
 import numpy as np
 import torch
+
+
+def get_device(device: str | torch.device | None = None) -> torch.device:
+    """Select the compute device.
+
+    Parameters
+    ----------
+    device : str or torch.device, optional
+        Requested device (e.g. "cpu", "cuda", "cuda:1"). If None, CUDA is used
+        when available, otherwise the CPU. If CUDA is explicitly requested but
+        not available, a message is printed and the CPU is used instead.
+
+    Returns
+    -------
+    torch.device
+    """
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = torch.device(device)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        print("CUDA requested but not available: falling back to CPU.")
+        device = torch.device("cpu")
+    return device
 
 
 def sinkhorn(
