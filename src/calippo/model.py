@@ -87,6 +87,12 @@ class Mesh(torch.nn.Module, ABC):
         self.register_buffer("static_phases_mask", sp_mask)
         self.register_buffer("xtalk_mask", xt_mask)
 
+        # Static (non-trainable) lookup structures used by the fast forward pass. They are non-persistent, so
+        # state_dict() / checkpoints are exactly the same as before.
+        self.register_buffer("phase_map", self._generate_phase_map(), persistent=False)
+        self._build_mixing_structure()
+        self._M_key = None  # cache key of the last mixing-layer build (see _refresh_mixing_layer)
+
         # Populates xtalk, static phases, nl_factor, and beam splitters angle
         if calibration_file is not None:
             sp, xt, nl, sigma = self.import_calibration(calibration_file)
@@ -139,6 +145,36 @@ class Mesh(torch.nn.Module, ABC):
     @abstractmethod
     def _compute_mixing_layer(self) -> torch.Tensor:
         pass
+
+    def _generate_phase_map(self) -> torch.Tensor | None:
+        """Constant (n_phases, n_phases) matrix R such that ``phases_eff = phases @ R.T`` applies the architecture's
+        external-phase remapping. None (default) means no remapping is needed."""
+        return None
+
+    def _build_mixing_structure(self) -> None:
+        """Hook: register any constant lookup buffers needed by ``_compute_mixing_layer`` / the forward pass."""
+
+    def _forward_unitary(self, phases: torch.Tensor) -> torch.Tensor:
+        """Unitary from phases that already went through ``phase_map``. Subclasses may override with a fast path."""
+        return self.U_from_phases(phases)
+
+    def _refresh_mixing_layer(self) -> None:
+        """Bring ``self.M`` in sync with ``self.sigma`` for the forward pass, doing the work only when needed.
+
+        - sigma is being trained (requires grad, grad mode on): rebuild every call, the autograd graph is required.
+        - otherwise (sigma frozen, or evaluation under no_grad): rebuild only if sigma actually changed since the
+          last build, detected through its in-place version counter / storage pointer.
+        """
+        sigma = self.sigma
+        if sigma.requires_grad and torch.is_grad_enabled():
+            self.M = self._compute_mixing_layer()
+            self._M_key = None
+            return
+        key = (sigma._version, sigma.data_ptr(), sigma.device)
+        if key != self._M_key:
+            with torch.no_grad():
+                self.M = self._compute_mixing_layer()
+            self._M_key = key
 
     def import_calibration(self, file_name: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -460,24 +496,23 @@ class Mesh(torch.nn.Module, ABC):
 
     def forward(self, currents):
         # Mask gradients to enforce physical parameters and prevent optimizer artifacts.
-        # (the optimizer must not "invent" nonexistent coupling paths or heaters).
         sp_active = self.static_phases * self.static_phases_mask  # type: ignore[operator]
         xt_active = self.xtalk * self.xtalk_mask  # type: ignore[operator]
 
+        I2 = currents**2
         if self.non_linear:
-            nl_term = self.nl_factor * self.static_phases_mask  # type: ignore[operator]
-        else:
-            nl_term = torch.zeros_like(self.nl_factor, dtype=torch.float64)
-
-        I2_eff = currents**2 * (1 + nl_term * currents**2)
-        phases = sp_active + I2_eff @ xt_active.T
+            I2 = I2 * (1 + (self.nl_factor * self.static_phases_mask) * I2)  # type: ignore[operator]
+        if self.phase_map is not None:
+            xt_active = self.phase_map @ xt_active
+            sp_active = self.phase_map @ sp_active
+        phases = torch.addmm(sp_active, I2, xt_active.T)
 
         # update the mixing layer matrix
         if self.unbalanced_beam_splitters:
-            self.M = self._compute_mixing_layer()
+            self._refresh_mixing_layer()
 
-        U = self.U_from_phases(phases)
-        return torch.abs(U)
+        U = torch.abs(self._forward_unitary(phases)).contiguous()
+        return U
 
     def export_calibration(
         self,
@@ -686,6 +721,82 @@ class Clements(Mesh):
     def n_mixing_layers(self) -> int:
         return 2 * self.n_modes  # Number of mixing layers (EXCLUDING the phase blocks)
 
+    def _generate_phase_map(self) -> torch.Tensor:
+        """
+        Constant matrix R (n_phases x n_phases) implementing the external-phase remapping of the Clements mesh
+        (the in-place column additions that used to run on every call of ``U_from_phases``):
+        ``phases_eff = phases @ R.T``. The sequential column updates are replayed once, here, as row operations on R.
+        """
+        P, N = self.n_phases, self.n_modes
+        R = torch.eye(P, dtype=torch.float64)
+        offset = P // 2
+        delta = int(N // 2 - 1)
+        counter = 1
+        for ii in range(N // 2 + offset, N - 1 + offset):
+            for k in range(counter):
+                R[ii + (k + 1) * delta] += R[ii]
+            counter += 2
+        return R
+
+    def _build_mixing_structure(self) -> None:
+        """
+        Precompute, once, the constant index structures that turn the per-call Python loops of the original
+        implementation into a handful of tensor ops:
+
+        - ``_mix_const`` / ``_mix_index``: the N mixing layers (flattened) with their constant entries, and the flat
+          positions where the cos/sin of every beam splitter has to be written (see ``_compute_mixing_layer``).
+        - ``_phase_pos``: for each of the n_phases phases, its flat position (layer * N + mode) in the per-layer
+          diagonal phase screens (see ``_propagate``).
+        """
+        N, P = self.n_modes, self.n_phases
+        J = P // 2  # number of MZIs / beam-splitter angles
+        n_layers = self.n_mixing_layers
+
+        # ---- beam-splitter -> (pattern, row) placement, same ordering as the original block_diag construction
+        cycle = [N // 2, N // 2 - 1]
+        pat_l, row_l = [], []
+        idx, p = 0, 0
+        while idx < J:
+            end = min(idx + cycle[p % 2], J)
+            for q in range(end - idx):
+                pat_l.append(p)
+                row_l.append(2 * q + (p % 2))  # odd patterns are shifted by one mode
+            idx, p = end, p + 1
+        n_pat = p
+
+        pat = torch.tensor(pat_l, dtype=torch.long)
+        r = torch.tensor(row_l, dtype=torch.long)
+
+        def flat(row, col):
+            return (pat * N + row) * N + col
+
+        mix_index = torch.cat([flat(r, r), flat(r + 1, r + 1), flat(r, r + 1), flat(r + 1, r)])
+        mix_const = torch.zeros(n_pat, N, N, dtype=torch.complex128)
+        mix_const[1::2, 0, 0] = 1.0  # odd patterns leave the two edge modes untouched
+        mix_const[1::2, N - 1, N - 1] = 1.0
+
+        # ---- phase -> (layer, mode) placement, same consumption order as the original layer loop
+        idx_v1 = list(range(0, N, 2))
+        idx_v2 = list(range(1, N - 1, 2))
+        layer_specs = [(False, idx_v1), (True, idx_v1), (False, idx_v2), (True, idx_v2)]
+        phase_pos = torch.full((P,), -1, dtype=torch.long)
+        int_ptr, ext_ptr = 0, P // 2
+        for ii in range(n_layers):
+            is_internal, modes = layer_specs[ii % 4]
+            ptr = int_ptr if is_internal else ext_ptr
+            for k, mode in enumerate(modes):
+                phase_pos[ptr + k] = ii * N + mode
+            if is_internal:
+                int_ptr += len(modes)
+            else:
+                ext_ptr += len(modes)
+        if (phase_pos < 0).any():
+            raise RuntimeError("Phase placement does not cover all phases: unsupported number of modes.")
+
+        self.register_buffer("_mix_index", mix_index, persistent=False)
+        self.register_buffer("_mix_const", mix_const.reshape(-1), persistent=False)
+        self.register_buffer("_phase_pos", phase_pos, persistent=False)
+
     def _compute_mixing_layer(self) -> torch.Tensor:
         """
         Generate the static mixing layers (directional couplers) for the Clements
@@ -750,64 +861,55 @@ class Clements(Mesh):
         if phases.shape[-1] != self.n_phases:
             raise ValueError(f"Dimension mismatch: expected {self.n_phases} elements, found {phases.shape[-1]}.")
 
-        phases = phases.to(self.device).clone()  # Avoid input modification
-
-        idx_start = self.n_modes // 2
-        idx_end = self.n_modes - 1
-        offset = self.n_phases // 2
-        delta = int(self.n_modes // 2 - 1)
-        counter = 1
-
-        # External phase remapping inversion
-        for ii in range(idx_start + offset, idx_end + offset):
-            for k in range(counter):
-                phases[:, ii + (k + 1) * delta] += phases[:, ii]
-            counter += 2
-
-        B = phases.shape[0]
-
-        # (B, N, N) identity array
-        U = torch.eye(self.n_modes, device=phases.device, dtype=torch.complex128).unsqueeze(0).repeat(B, 1, 1)
-
-        # Pointers for internal and external phases
-        int_ptr = 0
-        ext_ptr = self.n_phases // 2
-
-        # Sizes for each layer type
-        size_v1 = self.n_modes // 2
-        size_v2 = self.n_modes // 2 - 1
-
-        idx_v1 = torch.arange(0, self.n_modes, 2, device=phases.device)
-        idx_v2 = torch.arange(1, self.n_modes - 1, 2, device=phases.device)
-
-        # Layer structure: (is_internal, size_v, indices)
-        layer_specs = [
-            (False, size_v1, idx_v1),  # pattern 0: V1 ext
-            (True, size_v1, idx_v1),  # pattern 1: V1 int
-            (False, size_v2, idx_v2),  # pattern 2: V2 ext
-            (True, size_v2, idx_v2),  # pattern 3: V2 int
-        ]
-
-        def consume_phases(phase_tensor, ptr, size):
-            return phase_tensor[:, ptr : ptr + size], ptr + size
-
-        for ii in range(self.n_mixing_layers):
-            is_internal, size_v, indices = layer_specs[ii % 4]
-
-            if is_internal:
-                layer_phases, int_ptr = consume_phases(phases, int_ptr, size_v)
-            else:
-                layer_phases, ext_ptr = consume_phases(phases, ext_ptr, size_v)
-
-            phase_multiplier = torch.ones((B, self.n_modes), dtype=torch.complex128, device=phases.device)
-            phase_multiplier[:, indices] = torch.exp(1j * layer_phases).to(torch.complex128)
-
-            # Broadcasting phase multiplier along rows: (B, N, 1)
-            U = U * phase_multiplier.unsqueeze(2)
-
-            # Multiplication by the current mixing layer
-            U = torch.matmul(self.M[ii], U)
+        U = self._propagate(phases @ self.phase_map.T).contiguous()
         return U
+
+
+    def _forward_unitary(self, phases: torch.Tensor) -> torch.Tensor:
+        # ``phases`` already went through the phase map (folded into the cross-talk matrix by Mesh.forward)
+        return self._propagate(phases)
+
+    def _propagate(self, phases: torch.Tensor) -> torch.Tensor:
+        """
+        Propagate light through the whole mesh given the *remapped* phases, shape (B, n_phases) -> (B, N, N).
+
+        The mesh is a chain of 2N layers, each ``M_l @ diag(d_l)`` with d_l the phase screen of layer l:
+
+            U = (M_{L-1} D_{L-1}) @ ... @ (M_1 D_1) @ (M_0 D_0)
+
+        Two things make this much cheaper than multiplying B small matrices layer by layer:
+
+        1. All phase screens are built at once (one exp + one index_copy) instead of one ones/index_put/exp per layer.
+        2. The batch is folded into the *columns* of the running product, U of shape (N, B, N). Since the mixing
+           matrix M_l is shared by all samples, ``M_l @ U`` for the whole batch is a single (N x N)@(N x B*N) GEMM,
+           rather than B tiny batched matmuls. The phase screen is applied to the rows of U as a cheap elementwise
+           product *before* the GEMM, so in the backward pass the (dense) matrix gradient is only ever needed for U
+           and, when the splitting ratios are trained, for the shared M_l - never per sample.
+
+        Returns a (B, N, N) view of the (N, B, N) result (not necessarily contiguous).
+        """
+        B = phases.shape[0]
+        N, L = self.n_modes, self.n_mixing_layers
+
+        if phases.device.type == "cpu":
+            # complex exp is a scalar loop on CPU; cos/sin are vectorized (~2.4x faster, same value to 1 ulp)
+            E = torch.complex(torch.cos(phases), torch.sin(phases))
+        else:
+            E = torch.exp(1j * phases)  # one cheap kernel on GPU
+        screens = torch.ones(L * N, B, dtype=torch.complex128, device=phases.device)
+        screens = screens.index_copy(0, self._phase_pos, E.T).view(L, N, B)  # unused modes keep phase factor 1
+
+        # unbind (not screens[l] / M[l]): its backward is one stack instead of L zero-filled full-size gradients
+        screens = screens.unbind(0)
+        Ms = self.M.unbind(0)
+
+        # First layer acts on the identity: (M_0 @ diag(d_0))[i, j] = M_0[i, j] * d_0[j]
+        d0 = screens[0].T.contiguous()  # (B, N); contiguous operands keep U in a plain (N, B, N) layout
+        U = Ms[0].unsqueeze(1) * d0.unsqueeze(0)  # (N, 1, N) * (1, B, N) -> (N, B, N)
+        for l in range(1, L):
+            U = U * screens[l].unsqueeze(2)  # phase screen on the rows: (N, B, 1)
+            U = torch.mm(Ms[l], U.reshape(N, B * N)).view(N, B, N)
+        return U.permute(1, 0, 2)
 
     def phases_from_U(self, U_target: torch.Tensor, target_infidelity: float = 1e-6, **kwargs) -> torch.Tensor:
         """
