@@ -45,6 +45,9 @@ except KeyboardInterrupt:
 
 # Export best model weights
 processor.export_calibration("calibration.pkl", state_dict=pipeline.best_weights)
+
+# Plot training results
+pipeline.plot_training_results(save_path="train_results.png")
 ```
 
 ## Issues

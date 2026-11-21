@@ -1,10 +1,7 @@
 # PROJECT: Training Pipeline
 
 # TODO:
-# - Improve convergence speed (dual optimizer steps)
 # - Check if model is properly reset after each restart
-# - Compute the sign cross-talk matrix computationally
-#     - cross-talk matrix valid for any N-mode photonic chips with Clements layout.
 # - Study cross-talk checking and fixing frequency
 #     - Observed large jumps in loss evolution when the cross-talk matrix is checked and fixed
 #     - Investigate whether checking and fixing it more often improves convergence
@@ -22,6 +19,8 @@
 # - Move from an absolute min_loss_delta to a relative one
 #     - A low absolute delta is ineffective early in training, when loss is high and the model is exploring the solution space
 #     - A low delta is needed near the end of training, when loss is low, so the relative threshold scales with the loss
+# - Compute the sign cross-talk matrix computationally
+#     - cross-talk matrix valid for any N-mode photonic chips with Clements layout.
 
 from __future__ import annotations
 
@@ -30,6 +29,7 @@ import math
 import pathlib
 import pickle
 import time
+
 from dataclasses import dataclass
 from typing import Callable
 
@@ -37,7 +37,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from calippo.tools import amplitude_fidelity, make_real_border, sinkhorn
+from calippo.tools import amplitude_fidelity, make_real_border, sinkhorn, clements_xtalk_sign
+
+_SIGN_CACHE: dict = {}
 
 
 @dataclass
@@ -55,6 +57,8 @@ class TrainingConfig:
     escape_patience: int = 500
     max_escape_attempts: int = 15
     min_loss_rel_delta: float = 0.01
+    rel_stagnation_window: int = 1000
+    rel_stagnation_drop: float = 0.01
 
     # Optimization
     initial_lr: float = 1e-7
@@ -62,51 +66,13 @@ class TrainingConfig:
     lr_scheduler_factor: float = 0.5
 
 
-# fmt: off
-sign_data = [
-    [1, -1, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [1, 1, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 1, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 1, -1, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 1, 1, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 0, 0, 0, 1, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, -1, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, -1, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, -1, -1, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, -1, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 1, 1, 1, -1, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, -1, 1, -1, 0, 0, 0, 0, 0],
-    [0, 0, 0, 1, 1, 1, 1, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0],
-    [0, 0, 0, 1, 1, 1, -1, -1, -1, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, -1, -1, -1, 1, -1, -1, 0, 0],
-    [0, 0, 0, 1, 1, 1, 1, -1, 1, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, -1, 0, 0],
-    [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0],
-    [0, 0, 0, 1, 1, 1, 1, -1, 1, -1, 1, -1, -1, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, -1, 1, -1],
-    [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1],
-]
-# fmt: on
-
-
-_SIGN_CACHE: dict = {}
-
 
 def _xtalk_sign(model) -> torch.Tensor:
     """Cross-talk sign pattern as a tensor living on the model's device (built once, reused every epoch)."""
     key = (model.xtalk.device, model.xtalk.dtype)
     sign = _SIGN_CACHE.get(key)
     if sign is None:
-        sign = torch.tensor(sign_data, dtype=model.xtalk.dtype, device=model.xtalk.device)
+        sign = clements_xtalk_sign(model.n_modes, dtype=model.xtalk.dtype).to(model.xtalk.device)
         _SIGN_CACHE[key] = sign
     return sign
 
@@ -406,10 +372,10 @@ class TrainingPipeline:
                 global_epoch += epochs_spent
 
                 if success:
-                    print(f"Target fidelity achieved in start {start_idx+1}!")
+                    print(f"Target fidelity achieved in start {start_idx+1}!\n")
                     break
                 else:
-                    print(f" [EOS] Best achieved fidelity: {best_fid:.4f} ".center(120, '-'))
+                    print(f" [EOS] Best achieved fidelity: {best_fid:.4f} ".center(120, '-'), "\n")
 
                 # Re-init and Find LR
                 reinitialize_model_parameters(self.trainer.model, self.config.current_2pi)
@@ -495,7 +461,7 @@ class TrainingPipeline:
             # Escape Logic
             if epochs_no_improve >= self.config.escape_patience:
                 if escape_attempts >= self.config.max_escape_attempts:
-                    print("Max escape attempts reached. Abandoning start.\n")
+                    print("Max escape attempts reached. Abandoning start.")
                     return False, current_epoch - old_epoch, best_fid_this_start
 
                 # Check cross-talk matrix
