@@ -17,17 +17,19 @@ UniversalPhotonicProcessor
     Main controller for UPP hardware orchestration (Switch, OPM, Qontrol).
 """
 
-import numpy as np
 from typing import List, Optional
+
+import numpy as np
 
 # Hardware imports
 from fastruments.LfiberSwtich import FiberSwitch
-from fastruments.SantecOPM150 import OPM150
 from fastruments.Qontrol import Q8iv
+from fastruments.SantecOPM150 import OPM150
+
+from calippo.model import Bell, Clements
 
 # UPP imports
 from calippo.tools import sinkhorn
-from calippo.model import Bell, Clements
 
 
 class UniversalPhotonicProcessor:
