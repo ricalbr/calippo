@@ -1,3 +1,28 @@
+# PROJECT: Training Pipeline
+
+# TODO:
+# - Improve convergence speed (dual optimizer steps)
+# - Check if model is properly reset after each restart
+# - Compute the sign cross-talk matrix computationally
+#     - cross-talk matrix valid for any N-mode photonic chips with Clements layout.
+# - Study cross-talk checking and fixing frequency
+#     - Observed large jumps in loss evolution when the cross-talk matrix is checked and fixed
+#     - Investigate whether checking and fixing it more often improves convergence
+# - Make trainer and pipeline modular
+#     - Current configuration is standard
+#     - Modular Pipeline means design custom pipelines and checks/callbacks to manage and stop epochs as well as
+#     optimizers and schedulers
+#     - Modular Trainer means change it's component. It can be set up with custom loss function, custom optimizer, custom
+#     scheduler
+
+# DONE:
+# - Move to CUDA-compatible code
+#     - get_device() checks wheter CUDA is available and use it in every tensor in the model (see tools.py)
+# - Optimize code speed (in-place operations wherever possible, all CUDA-compatible)
+# - Move from an absolute min_loss_delta to a relative one
+#     - A low absolute delta is ineffective early in training, when loss is high and the model is exploring the solution space
+#     - A low delta is needed near the end of training, when loss is low, so the relative threshold scales with the loss
+
 from __future__ import annotations
 
 import copy
@@ -28,8 +53,8 @@ class TrainingConfig:
 
     # Stagnation & Escape Params
     escape_patience: int = 500
-    max_escape_attempts: int = 10
-    min_loss_delta: float = 1e-7
+    max_escape_attempts: int = 15
+    min_loss_rel_delta: float = 0.01
 
     # Optimization
     initial_lr: float = 1e-7
@@ -71,7 +96,6 @@ sign_data = [
     [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1],
 ]
 # fmt: on
-
 
 
 _SIGN_CACHE: dict = {}
@@ -296,7 +320,6 @@ class CrosstalkManager:
 
 class Trainer:
     def __init__(self, model, config: TrainingConfig):
-        # TODO: make it accept different losses, optimizers and schedulers
         self.model = model
         self.config = config
         self.criterion = torch.nn.MSELoss()
@@ -353,6 +376,8 @@ class TrainingPipeline:
         self.config = config
         self.best_overall_fidelity = -1.0
         self.best_weights = None
+        self.loss_history = {"epoch": [], "loss": []}
+        self.eval_history = {"epoch": [], "fid_train": [], "fid_test": [], "lr": []}
 
     def run_multi_start(self, train_data, test_data):
         i_train, u_train = train_data
@@ -414,7 +439,8 @@ class TrainingPipeline:
             loss = self.trainer.train_one_epoch(i_train, u_train)
 
             # Stagnation Tracking
-            if loss < best_loss_this_start - self.config.min_loss_delta:
+            if loss < best_loss_this_start * (1.0 - self.config.min_loss_rel_delta):
+                # if loss < best_loss_this_start - self.config.min_loss_delta:
                 best_loss_this_start, epochs_no_improve = loss, 0
             else:
                 epochs_no_improve += 1
@@ -435,6 +461,14 @@ class TrainingPipeline:
                     f"Loss: {loss:.2e} |",
                     f"Time/Epoch: {elapsed_time * 1000 /self.config.check_interval:3.2f} ms",
                 )
+
+                self.eval_history["epoch"].append(current_epoch)
+                self.eval_history["fid_train"].append(fid_train)
+                self.eval_history["fid_test"].append(fid_test)
+                self.eval_history["lr"].append(self.trainer.optimizer.param_groups[0]['lr'])
+
+                self.loss_history["epoch"].append(current_epoch)
+                self.loss_history["loss"].append(loss)
 
                 if fid_test >= self.config.target_fidelity:
                     return True, current_epoch - old_epoch, fid_test
@@ -484,6 +518,68 @@ class TrainingPipeline:
                     return False, current_epoch - old_epoch, best_fid_this_start
 
         return False, current_epoch - old_epoch, best_fid_this_start
+
+    def plot_training_results(self, save_path: str | None = None, show: bool = False) -> plt.Figure:
+        """
+        Plot training loss, test and train fidelity, target fidelity, and learning rate.
+
+        The figure has two panels sharing the epoch axis. The top panel shows train and
+        test fidelity against the target fidelity, sampled every ``check_interval`` epochs.
+        The bottom panel shows the per-epoch loss on a log scale, with the learning rate
+        on a secondary log-scale axis.
+
+        Args:
+            save_path: Optional file path to save the figure, e.g. ``"training.png"``.
+                The output format is inferred from the extension. If None, the figure
+                is not saved.
+            show: If True, display the figure with ``plt.show()``. Defaults to False so
+                the method can be used in non-interactive environments.
+
+        Returns:
+            The matplotlib ``Figure`` object, which can be customized further or closed.
+
+        Raises:
+            ValueError: If no training history has been recorded. Call
+                ``run_multi_start()`` before plotting.
+        """
+
+        if not self.loss_history["epoch"]:
+            raise ValueError("No training history found. Run run_multi_start() first.")
+
+        ev, lh = self.eval_history, self.loss_history
+        fig, (ax_fid, ax_loss) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+
+        # Fidelity panel
+        ax_fid.plot(ev["epoch"], ev["fid_train"], label="Train fidelity")
+        ax_fid.plot(ev["epoch"], ev["fid_test"], label="Test fidelity")
+        ax_fid.axhline(self.config.target_fidelity, color="r", linestyle="--", label="Target")
+        ax_fid.set_ylabel("Fidelity")
+        ax_fid.grid(True, alpha=0.3)
+        ax_fid.legend(loc="lower right")
+
+        # Loss panel (log scale) with learning rate on a secondary axis
+        ax_loss.semilogy(lh["epoch"], lh["loss"], color="tab:orange", label="Loss")
+        ax_loss.set_ylabel("Loss (log scale)")
+        ax_loss.set_xlabel("Global epoch")
+        ax_loss.grid(True, alpha=0.3)
+
+        ax_lr = ax_loss.twinx()
+        ax_lr.semilogy(ev["epoch"], ev["lr"], color="tab:green", linestyle=":", label="Learning rate")
+        ax_lr.set_ylabel("Learning rate (log scale)")
+
+        lines, labels = ax_loss.get_legend_handles_labels()
+        lines2, labels2 = ax_lr.get_legend_handles_labels()
+        ax_loss.legend(lines + lines2, labels + labels2, loc="upper right")
+
+        fig.suptitle("Training Results")
+        fig.tight_layout()
+
+        if save_path:
+            fig.savefig(save_path, dpi=150)
+
+        if show:
+            plt.show()
+        return fig
 
 
 def load_data(
@@ -573,7 +669,6 @@ if __name__ == "__main__":
     val = f"{pipeline.best_overall_fidelity:.4f}".replace('.', '_')
     processor.export_calibration(f"{str(datapath).split('_')[0]}_F{val}.pkl", state_dict=pipeline.best_weights)
 
-    # TODO: check if traning config is really necessary, unpack all data
-    # TODO: add visualization
-    # plot_training_history(pipeline.history, cfg.target_fidelity, path="training_history.png")
+    # Plot training results
+    pipeline.plot_training_results(save_path="train_results.png")
     # load model, evaluate on test set and plot fidelity histogram
