@@ -864,7 +864,6 @@ class Clements(Mesh):
         U = self._propagate(phases @ self.phase_map.T).contiguous()
         return U
 
-
     def _forward_unitary(self, phases: torch.Tensor) -> torch.Tensor:
         # ``phases`` already went through the phase map (folded into the cross-talk matrix by Mesh.forward)
         return self._propagate(phases)
