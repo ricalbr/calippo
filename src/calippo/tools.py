@@ -277,12 +277,97 @@ def get_haar_unitary(size: int, batch_size: int = 1, device: Optional[torch.devi
     Q *= phases.unsqueeze(1)
 
     return Q
-    # return Q[0] if batch_size == 1 else Q
 
 
-# ==================================================================
-# Entry Point
-# ==================================================================
+def clements_xtalk_sign(n_modes: int, dtype: torch.dtype = torch.int8) -> torch.Tensor:
+    """
+    Sign matrix of the thermal cross-talk of a Clements mesh with ``n_modes`` modes.
+
+    Entry [i, j] is the sign of the phase change induced on shifter i (the victim) by the power dissipated in
+    shifter j (the aggressor): +1, -1, or 0 when the two do not interact. The matrix is organized in quadrants
+    (n = number of shifters / 2)::
+
+        [ internal <- internal |        0         ]   top    (victims: internal shifters)
+        [ external <- internal | external <- external ]   bottom (victims: external shifters)
+
+    Which shifters interact
+        * Internal victim: only the internal shifters of its own layer.
+        * External victim: every shifter (internal or external) between its own layer and the layer where its
+          light path, followed backwards, would leave the chip. The path moves one waveguide down every two
+          layers, so it reaches the bottom waveguide at layer ``victim.layer - 2 * (n_modes - 1 - victim.mode)``.
+          The search stops at layer 2, where the unused input phase shifters sit.
+        * Unused input shifters (see ``Shifter.used``) interact with nothing.
+
+    Sign of an interaction
+        A shifter heats the waveguides around it. The victim's phase is set by the heat on its own light path,
+        so the aggressor counts as "+" when it lies on, or above, that path, and as "-" when it lies below.
+        The path of an MZI shifter is traced backwards to the aggressor's layer, where it sits at waveguide
+        ``victim.mode + (victim.layer - aggressor.layer) / 2``. Hence::
+
+            sign = +1  if  aggressor.mode <= victim.mode + (victim.layer - aggressor.layer) / 2
+                   -1  otherwise
+
+        For aggressors in the victim's own layer this reduces to "+" for the shifter itself and for the ones
+        below it, "-" for the ones above it.
+
+    Parameters
+    ----------
+    n_modes : int
+        Number of optical modes (>= 2).
+    dtype : torch.dtype, optional
+        Output dtype. Default is torch.int8; use torch.float64 to multiply directly with the model parameters.
+
+    Returns
+    -------
+    torch.Tensor, shape (n_modes * (n_modes - 1), n_modes * (n_modes - 1))
+        The sign matrix, with the phase ordering of ``clements_shifters``.
+    """
+    # The first two columns of external phase shifters (N - 1 shifters in total) only set the phases of the input
+    # modes: they do not affect the measured intensities, so they are not part of the cross-talk model.
+    unused_external_cols = 2
+
+    n_mzi = n_modes * (n_modes - 1) // 2
+    layer_e, layer_i = [], []
+    mode_e, mode_i = [], []
+    used_e, used_i = [], []
+
+    for col in range(n_modes):
+        for m in range(col % 2, n_modes - 1, 2):
+            # external
+            layer_e.append(2 * col)
+            mode_e.append(m)
+            used_e.append(col >= unused_external_cols)
+
+            # internal
+            layer_i.append(2 * col + 1)
+            mode_i.append(m)
+            used_i.append(True)
+
+    layer = torch.tensor(layer_i + layer_e)
+    mode = torch.tensor(mode_i + mode_e)
+    is_internal = torch.tensor([True] * n_mzi + [False] * n_mzi)
+    used = torch.tensor(used_i + used_e)
+
+    # Rows are victims, columns are aggressors.
+    victim_layer, aggressor_layer = layer[:, None], layer[None, :]
+    victim_mode, aggressor_mode = mode[:, None], mode[None, :]
+
+    # who interacts with whom
+    last_unused_layer = 2 * (unused_external_cols - 1)
+    path_leaves_chip = layer - 2 * (n_modes - 1 - mode)  # layer at which a victim's path reaches the bottom waveguide
+    reach = torch.clamp(path_leaves_chip, min=last_unused_layer)[:, None]  # earliest layer a victim feels, per row
+
+    internal_victim = is_internal[:, None] & is_internal[None, :] & (victim_layer == aggressor_layer)
+    external_victim = ~is_internal[:, None] & (reach <= aggressor_layer) & (aggressor_layer <= victim_layer)
+    interacts = (internal_victim | external_victim) & used[:, None] & used[None, :]
+
+    # sign of the interaction (doubled to stay in integers: the path may sit between two waveguides)
+    on_or_above_path = 2 * aggressor_mode <= 2 * victim_mode + (victim_layer - aggressor_layer)
+    sign = torch.where(on_or_above_path, 1, -1)
+
+    return (interacts * sign).to(dtype)
+
+
 if __name__ == "__main__":
 
     import traceback
@@ -400,6 +485,3 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"{e}")
         traceback.print_exc()
-
-    finally:
-        pass
