@@ -95,7 +95,7 @@ class Mesh(torch.nn.Module, ABC):
 
         # Populates xtalk, static phases, nl_factor, and beam splitters angle
         if calibration_file is not None:
-            sp, xt, nl, sigma = self.import_calibration(calibration_file)
+            sp, xt, nl, sigma = self.read_calibration(calibration_file)
         else:
             sp, xt, nl, sigma = self.generate_random_calibration(xtalk_ampl=1.0, static_phases_ampl=2 * torch.pi)
 
@@ -176,9 +176,9 @@ class Mesh(torch.nn.Module, ABC):
                 self.M = self._compute_mixing_layer()
             self._M_key = key
 
-    def import_calibration(self, file_name: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def read_calibration(self, file_name: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Import calibration data from a pickle file.
+        Read and extract calibration data from a pickle file.
 
         Parameters
         ----------
@@ -206,8 +206,13 @@ class Mesh(torch.nn.Module, ABC):
                 calibration = pickle.load(f)
         except FileNotFoundError as e:
             raise FileNotFoundError(f"Calibration file not found: {file_name}") from e
-        except pickle.UnpicklingError as e:
-            raise ValueError(f"Failed to load pickle file {file_name}: {e}") from e
+        except (pickle.UnpicklingError, EOFError, ValueError, KeyError, IndexError) as pickle_err:
+            try:
+                calibration = torch.load(file_name, map_location=self.device, weights_only=False)
+            except Exception as torch_err:
+                raise ValueError(
+                    f"Failed to load calibration file {file_name} with pickle ({pickle_err}) " f"or torch ({torch_err})"
+                ) from torch_err
 
         # Input validation
         self._validate_calibration(calibration=calibration)
@@ -347,8 +352,7 @@ class Mesh(torch.nn.Module, ABC):
             I = torch.sqrt(torch.rand(batch_size, self.n_phases, device=self.device)) * current_ampl
 
         # Return only useful currents
-        I *= self.static_phases_mask.cpu().float()
-        return I
+        return I.mul_(self.static_phases_mask.to(device=I.device, dtype=I.dtype))
 
     def phases_from_currents(self, currents: torch.Tensor) -> torch.Tensor:
         """
@@ -548,15 +552,16 @@ class Mesh(torch.nn.Module, ABC):
         calibration = {
             "N": int(self.n_modes),
             "n_heaters": int(self.n_phases),
-            "static_phases": torch.remainder(static * sp_mask, 2 * torch.pi),
-            "xt_matrix": xtalk * xt_mask,
-            "nl_factor": nl_factor * sp_mask.to(nl_factor.device),
-            "sigma": param("sigma"),
+            "static_phases": torch.remainder(static * sp_mask, 2 * torch.pi).cpu().numpy(),
+            "xt_matrix": (xtalk * xt_mask).cpu().numpy(),
+            "nl_factor": (nl_factor * sp_mask.to(nl_factor.device)).cpu().numpy(),
+            "sigma": param("sigma").cpu().numpy(),
         }
 
         path = pathlib.Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(calibration, path)
+        with open(path, "wb") as f:
+            pickle.dump(calibration, f, protocol=pickle.HIGHEST_PROTOCOL)
 
         print(f"Calibration exported to {path}")
         return path
@@ -564,11 +569,11 @@ class Mesh(torch.nn.Module, ABC):
     def load_calibration(self, path: str | pathlib.Path) -> None:
         """Load a calibration file into an existing model, in place.
 
-        Reuses ``model.import_calibration``, so size checks and masking behave exactly as when
+        Reuses ``model.read_calibration``, so size checks and masking behave exactly as when
         passing ``calibration_file=`` to the constructor. For a linear model (``nonlinear=False``)
         the file's ``nl_factor`` is ignored and the model's is set to zero.
         """
-        static_phases, xtalk, nl_factor, sigma = self.import_calibration(str(path))
+        static_phases, xtalk, nl_factor, sigma = self.read_calibration(str(path))
 
         with torch.no_grad():
             for param, value in (
@@ -577,8 +582,7 @@ class Mesh(torch.nn.Module, ABC):
                 (self.nl_factor, nl_factor),
                 (self.sigma, sigma),
             ):
-                param.copy_(torch.from_numpy(np.asarray(value)).to(device=param.device, dtype=param.dtype))
-
+                param.copy_(torch.from_numpy(np.asarray(value)).to(device=self.device, dtype=param.dtype))
         print(f"Calibration loaded from {path}")
 
 
