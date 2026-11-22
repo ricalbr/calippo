@@ -1275,6 +1275,9 @@ class Clements(Mesh):
         start_idx = 0
         end_idx = self.n_phases // 2 - 1
 
+        if verbose:
+            print("[INFO] Beginning unitary decomposition...")
+
         global_counter = 0
         for k, i in enumerate(range(N - 2, -1, -1)):
             if k % 2 == 0:  # RIGHT ops: zero W[row, col] via  W <- W @ T(col, col+1)^dag
@@ -1306,13 +1309,15 @@ class Clements(Mesh):
         # Check if W is diagonal
         diff = torch.abs(W - torch.diag_embed(torch.diagonal(W, dim1=-2, dim2=-1)))
         is_non_diagonal = (diff > 1e-12).any(dim=(-2, -1))
-        non_diag_indices = torch.where(is_non_diagonal)[0]
+        n_non_diag = is_non_diagonal[is_non_diagonal == True].numel()
 
         if verbose:
-            if non_diag_indices.numel() > 0:
-                print(f"  Found {len(non_diag_indices)} non-diagonal matrices at indices")
+            if n_non_diag:
+                print(
+                    f"[INFO] {n_non_diag} of the {B} matrices are unreachable due to imperfections in the splitting ratio."
+                )
             else:
-                print("  All matrices are diagonal")
+                print(f"[INFO] All {B} matrices are reachable.")
 
         # W is diagonal, convert each LEFT op into an equivalent RIGHT op (batch).
         for op in reversed(left_ops):
@@ -1326,6 +1331,9 @@ class Clements(Mesh):
             W = torch.bmm(W, self.mzi_matrix_dag(m=op.m, n=op.n, theta=op.theta, phi=phi_new, sigma=op.sigma, N=N))
 
             right_ops.append(MZIOp(m=op.m, n=op.n, theta=op.theta, phi=phi_new, sigma=op.sigma, index=op.index))
+
+        if verbose:
+            print("[INFO] Unitary decomposition completed.")
 
         return W, sorted(right_ops, key=lambda x: x.index)
 
