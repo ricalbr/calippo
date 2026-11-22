@@ -1276,7 +1276,7 @@ class Clements(Mesh):
         end_idx = self.n_phases // 2 - 1
 
         if verbose:
-            print("[INFO] Beginning unitary decomposition...")
+            print(f"[{'INFO':<7}] Beginning unitary decomposition...")
 
         global_counter = 0
         for k, i in enumerate(range(N - 2, -1, -1)):
@@ -1313,11 +1313,9 @@ class Clements(Mesh):
 
         if verbose:
             if n_non_diag:
-                print(
-                    f"[INFO] {n_non_diag} of the {B} matrices are unreachable due to imperfections in the splitting ratio."
-                )
+                print(f"[{'WARNING':<7}] Reachability check failed\n{'':<10}{n_non_diag} of {B} matrices are unreachable (splitting ratio imperfections).")
             else:
-                print(f"[INFO] All {B} matrices are reachable.")
+                print(f"[{'INFO':<7}] Reachability check passed: all {B} matrices are reachable.")
 
         # W is diagonal, convert each LEFT op into an equivalent RIGHT op (batch).
         for op in reversed(left_ops):
@@ -1333,7 +1331,7 @@ class Clements(Mesh):
             right_ops.append(MZIOp(m=op.m, n=op.n, theta=op.theta, phi=phi_new, sigma=op.sigma, index=op.index))
 
         if verbose:
-            print("[INFO] Unitary decomposition completed.")
+            print(f"[{'INFO':<7}] Unitary decomposition completed.")
 
         return W, sorted(right_ops, key=lambda x: x.index)
 
