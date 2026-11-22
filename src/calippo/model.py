@@ -914,7 +914,8 @@ class Clements(Mesh):
             U = torch.mm(Ms[l], U.reshape(N, B * N)).view(N, B, N)
         return U.permute(1, 0, 2)
 
-    def phases_from_U(self, U_target: torch.Tensor, target_infidelity: float = 1e-6, **kwargs) -> torch.Tensor:
+    def phases_from_U(self, U_target: torch.Tensor, target_infidelity: float = 1e-6, verbose:bool = False,
+                      **kwargs) -> torch.Tensor:
         """
         Decomposes a target unitary matrix into the phases of the Clements mesh.
 
@@ -924,13 +925,15 @@ class Clements(Mesh):
             Target unitary matrix. Shape (n_modes, n_modes) or (B, n_modes, n_modes).
         target_infidelity : float, optional
             Target infidelity threshold. Default is 1e-6.
+        verbose : bool, optional
+            Flag for printing decomposition information. Default is False.
 
         Returns
         -------
         torch.Tensor
             Tensor of phases matching the mesh configuration.
         """
-        _, Tlist = self.decompose(U=U_target, tol=target_infidelity)
+        _, Tlist = self.decompose(U=U_target, tol=target_infidelity, verbose=verbose)
 
         th = torch.stack([t.theta for t in Tlist], dim=1)
         ph = torch.stack([t.phi for t in Tlist], dim=1)
@@ -1201,6 +1204,7 @@ class Clements(Mesh):
         self,
         U: torch.Tensor,
         tol: float = 1e-11,
+        verbose: bool = False,
     ) -> tuple[torch.Tensor, list[MZIOp]]:
         """
         Batched Clements decomposition of a unitary matrix batch.
@@ -1244,6 +1248,8 @@ class Clements(Mesh):
         right_ops : list[MZIOp]
             All MZI ops in application order. Reconstruct with
             ``U = D @ T_K @ ... @ T_1`` (reversed, using ``mzi_matrix`` not dag).
+        verbose : bool, optional
+            Flag for printing decomposition information. Default is False.
 
         Raises
         ------
@@ -1275,11 +1281,9 @@ class Clements(Mesh):
                     row, col = i + j + 1, j
                     idx = start_idx + (self.n_modes // 2 - 1) * counter
                     sigma = self.sigma[idx]
-                    # print(f"R index: {idx}")
                     theta, phi = self._phases_null_right(row, col, W, sigma)
                     right_ops.append(MZIOp(m=col, n=col + 1, theta=theta, phi=phi, sigma=sigma, index=idx))
 
-                    # old_val = W[:, row, col].item()
                     W = torch.bmm(W, self.mzi_matrix_dag(m=col, n=col + 1, theta=theta, phi=phi, sigma=sigma, N=N))
                     global_counter += 1
 
@@ -1290,11 +1294,9 @@ class Clements(Mesh):
                     row, col = i + j, j
                     idx = end_idx - (self.n_modes // 2 - 1) * counter
                     sigma = self.sigma[idx]
-                    # print(f"L index: {idx}")
                     theta, phi = self._phases_null_left(row, col, W, sigma)
                     left_ops.append(MZIOp(m=row, n=row + 1, theta=theta, phi=phi, sigma=sigma, index=idx))
 
-                    # old_val = W[:, row + 1, col].item()
                     W = torch.bmm(self.mzi_matrix(m=row, n=row + 1, theta=theta, phi=phi, sigma=sigma, N=N), W)
                     global_counter += 1
 
@@ -1305,10 +1307,11 @@ class Clements(Mesh):
         is_non_diagonal = (diff > 1e-12).any(dim=(-2, -1))
         non_diag_indices = torch.where(is_non_diagonal)[0]
 
-        if non_diag_indices.numel() > 0:
-            print(f"  Found {len(non_diag_indices)} non-diagonal matrices at indices")
-        else:
-            print("  All matrices are diagonal")
+        if verbose:
+            if non_diag_indices.numel() > 0:
+                print(f"  Found {len(non_diag_indices)} non-diagonal matrices at indices")
+            else:
+                print("  All matrices are diagonal")
 
         # W is diagonal, convert each LEFT op into an equivalent RIGHT op (batch).
         for op in reversed(left_ops):
