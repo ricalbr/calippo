@@ -1,10 +1,6 @@
 # PROJECT: Training Pipeline
 
 # TODO:
-# - Check if model is properly reset after each restart
-# - Study cross-talk checking and fixing frequency
-#     - Observed large jumps in loss evolution when the cross-talk matrix is checked and fixed
-#     - Investigate whether checking and fixing it more often improves convergence
 # - Make trainer and pipeline modular
 #     - Current configuration is standard
 #     - Modular Pipeline means design custom pipelines and checks/callbacks to manage and stop epochs as well as
@@ -21,6 +17,10 @@
 #     - A low delta is needed near the end of training, when loss is low, so the relative threshold scales with the loss
 # - Compute the sign cross-talk matrix computationally
 #     - cross-talk matrix valid for any N-mode photonic chips with Clements layout.
+# - Check if model is properly reset after each restart
+# - Study cross-talk checking and fixing frequency
+#     - Observed large jumps in loss evolution when the cross-talk matrix is checked and fixed
+#     - Investigate whether checking and fixing it more often improves convergence
 
 from __future__ import annotations
 
@@ -29,7 +29,6 @@ import math
 import pathlib
 import pickle
 import time
-
 from dataclasses import dataclass
 from typing import Callable
 
@@ -37,7 +36,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from calippo.tools import amplitude_fidelity, make_real_border, sinkhorn, clements_xtalk_sign
+from calippo.tools import (
+    amplitude_fidelity,
+    clements_xtalk_sign,
+    make_real_border,
+    sinkhorn,
+)
 
 _SIGN_CACHE: dict = {}
 
@@ -57,14 +61,12 @@ class TrainingConfig:
     escape_patience: int = 500
     max_escape_attempts: int = 15
     min_loss_rel_delta: float = 0.01
-    rel_stagnation_window: int = 1000
-    rel_stagnation_drop: float = 0.01
+    xt_check_interval: int = 1000  # epochs counted from the start of each restart; 0 = off
 
     # Optimization
     initial_lr: float = 1e-7
     lr_scheduler_patience: int = 200
     lr_scheduler_factor: float = 0.5
-
 
 
 def _xtalk_sign(model) -> torch.Tensor:
@@ -236,51 +238,33 @@ def reinitialize_model_parameters(model, current_2pi: float) -> None:
 
 
 class CrosstalkManager:
-    """Handles detection and resetting of anomalous crosstalk coefficients."""
+    DIAG_TOLERANCE = 0.50  # max deviation of a diagonal entry from the reference diagonal
+    OFFDIAG_LIMIT = 0.30  # max off-diagonal entry, as a fraction of the reference diagonal
+    OFFDIAG_RESET = 0.10  # value an offending off-diagonal is reset to
 
     @staticmethod
-    def analyze_anomalies(model) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Returns masks for bad diagonal and bad off-diagonal entries."""
-
+    def analyze_anomalies(model):
         with torch.no_grad():
-            xt_active = model.xtalk * model.xtalk_mask
-            diag = xt_active.diagonal().to(model.xtalk.device)
-            diag_mask = model.xtalk_mask.diagonal().bool()
-
-            valid_diag = diag[diag_mask]
-            mean_diag = (
-                valid_diag.abs().mean().clamp_min(1e-8)
-                if valid_diag.numel() > 0
-                else torch.tensor(1e-8, device=diag.device)
-            )
-
-            # Diagonal: Deviating > 50% from mean
-            diag_dev = (diag.abs() - mean_diag).abs() / mean_diag
-            bad_diag_mask = (diag_dev > 0.50) & diag_mask
-
-            # Off-Diagonal: > 30% of mean diagonal
-            offdiag_mask = model.xtalk_mask.bool().clone()
-            offdiag_mask.fill_diagonal_(False)
-            bad_offdiag_mask = offdiag_mask & (model.xtalk.abs() / mean_diag > 0.30)
-
-            return bad_diag_mask, bad_offdiag_mask, mean_diag
+            used = model.xtalk_mask.bool()
+            diag_used = used.diagonal()
+            diag = model.xtalk.diagonal().abs()
+            ref_diag = diag[diag_used].median().clamp_min(1e-8) if diag_used.any() else diag.new_tensor(1e-8)
+            bad_diag = diag_used & ((diag - ref_diag).abs() > CrosstalkManager.DIAG_TOLERANCE * ref_diag)
+            offdiag_used = used & ~torch.eye(used.shape[0], dtype=torch.bool, device=used.device)
+            bad_off = offdiag_used & (model.xtalk.abs() > CrosstalkManager.OFFDIAG_LIMIT * ref_diag)
+            return bad_diag, bad_off, ref_diag
 
     @staticmethod
-    def reset_anomalies(model, bad_diag_mask, bad_offdiag_mask, mean_diag):
-        """Applies resets to the mesh parameters."""
+    def reset_anomalies(model, bad_diag_mask, bad_offdiag_mask, ref_diag):
         with torch.no_grad():
-            # Reset off-diagonals to a small fraction of mean
-            model.xtalk[bad_offdiag_mask] = torch.sign(model.xtalk[bad_offdiag_mask]) * 0.10 * mean_diag
-
-            # Reset diagonals to mean
-            model.xtalk.diagonal()[bad_diag_mask] = torch.sign(model.xtalk.diagonal()[bad_diag_mask]) * mean_diag
-
-            # Randomize phases for bad diagonals
+            sign = _xtalk_sign(model)
+            model.xtalk[bad_offdiag_mask] = sign[bad_offdiag_mask] * CrosstalkManager.OFFDIAG_RESET * ref_diag
+            model.xtalk.diagonal()[bad_diag_mask] = sign.diagonal()[bad_diag_mask] * ref_diag
             sp_mask = bad_diag_mask & model.static_phases_mask.bool()
-            num_bad = sp_mask.sum().item()
-            if num_bad > 0:
+            n = sp_mask.sum().item()
+            if n > 0:
                 model.static_phases[sp_mask] = (
-                    torch.rand(num_bad, device=model.static_phases.device, dtype=torch.float64) * 2 * torch.pi
+                    torch.rand(n, device=model.static_phases.device, dtype=torch.float64) * 2 * torch.pi
                 )
 
 
@@ -390,11 +374,28 @@ class TrainingPipeline:
                 self.trainer.init_optimizer(opt_lr)
             break
 
+    def _repair_crosstalk(self, restart_lr: float | None = None) -> int:
+        """Look for anomalous cross-talk coefficients and reset them (bad diagonals also get new random static
+        phases). Returns the number of ill elements found, 0 meaning that nothing was touched.
+
+        ``restart_lr``: if given, Adam is restarted from this learning rate (fresh moments and scheduler). The periodic
+        check does not need it: the optimizer state is still valid, and restarting it costs more than it brings.
+        """
+        model = self.trainer.model
+        bad_diag, bad_off, mean_diag = CrosstalkManager.analyze_anomalies(model)
+        n_ill = int(bad_diag.sum() + bad_off.sum())
+        if n_ill:
+            CrosstalkManager.reset_anomalies(model, bad_diag, bad_off, mean_diag)
+            if restart_lr is not None:
+                self.trainer.init_optimizer(restart_lr)
+        return n_ill
+
     def _execute_start(self, i_train, u_train, i_test, u_test, opt_lr, current_epoch) -> tuple[bool, int, float]:
         best_loss_this_start = float('inf')
         best_fid_this_start = -1
         epochs_no_improve = 0
         escape_attempts = 0
+        periodic_fixes = 0
         nl_frozen = True
         sigma_frozen = True
         old_epoch = current_epoch
@@ -410,6 +411,13 @@ class TrainingPipeline:
                 best_loss_this_start, epochs_no_improve = loss, 0
             else:
                 epochs_no_improve += 1
+
+            if self.config.xt_check_interval and (current_epoch - old_epoch) % self.config.xt_check_interval == 0:
+                n_ill = self._repair_crosstalk()
+                if n_ill:
+                    periodic_fixes += 1
+                    print(f"XT FIX [periodic] - Found {n_ill} ill-elements in cross-talk matrix.")
+                    epochs_no_improve = 0
 
             # Evaluation & Curriculum
             if current_epoch % self.config.check_interval == 0 and current_epoch != 0:
@@ -465,19 +473,13 @@ class TrainingPipeline:
                     return False, current_epoch - old_epoch, best_fid_this_start
 
                 # Check cross-talk matrix
-                bad_diag, bad_off, mean_diag = CrosstalkManager.analyze_anomalies(self.trainer.model)
-
-                if bad_diag.any() or bad_off.any():
+                n_ill = self._repair_crosstalk(restart_lr=opt_lr)
+                if n_ill:
                     escape_attempts += 1
-                    CrosstalkManager.reset_anomalies(self.trainer.model, bad_diag, bad_off, mean_diag)
-
-                    # Reset Optimizer state after physical reset
-                    self.trainer.init_optimizer(opt_lr)
                     epochs_no_improve = 0
-
                     print(
                         f"XT FIX [{escape_attempts}/{self.config.max_escape_attempts}] -",
-                        f"Found {torch.sum(bad_diag) + torch.sum(bad_off)} ill-elements in cross-talk matrix.",
+                        f"Found {n_ill} ill-elements in cross-talk matrix.",
                     )
                 else:
                     print("Stagnation detected but no anomalies found. Moving to next start.\n")

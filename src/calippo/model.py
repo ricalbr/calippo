@@ -95,7 +95,7 @@ class Mesh(torch.nn.Module, ABC):
 
         # Populates xtalk, static phases, nl_factor, and beam splitters angle
         if calibration_file is not None:
-            sp, xt, nl, sigma = self.import_calibration(calibration_file)
+            sp, xt, nl, sigma = self.read_calibration(calibration_file)
         else:
             sp, xt, nl, sigma = self.generate_random_calibration(xtalk_ampl=1.0, static_phases_ampl=2 * torch.pi)
 
@@ -176,9 +176,9 @@ class Mesh(torch.nn.Module, ABC):
                 self.M = self._compute_mixing_layer()
             self._M_key = key
 
-    def import_calibration(self, file_name: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def read_calibration(self, file_name: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Import calibration data from a pickle file.
+        Read and extract calibration data from a pickle file.
 
         Parameters
         ----------
@@ -206,8 +206,13 @@ class Mesh(torch.nn.Module, ABC):
                 calibration = pickle.load(f)
         except FileNotFoundError as e:
             raise FileNotFoundError(f"Calibration file not found: {file_name}") from e
-        except pickle.UnpicklingError as e:
-            raise ValueError(f"Failed to load pickle file {file_name}: {e}") from e
+        except (pickle.UnpicklingError, EOFError, ValueError, KeyError, IndexError) as pickle_err:
+            try:
+                calibration = torch.load(file_name, map_location=self.device, weights_only=False)
+            except Exception as torch_err:
+                raise ValueError(
+                    f"Failed to load calibration file {file_name} with pickle ({pickle_err}) " f"or torch ({torch_err})"
+                ) from torch_err
 
         # Input validation
         self._validate_calibration(calibration=calibration)
@@ -347,8 +352,7 @@ class Mesh(torch.nn.Module, ABC):
             I = torch.sqrt(torch.rand(batch_size, self.n_phases, device=self.device)) * current_ampl
 
         # Return only useful currents
-        I *= self.static_phases_mask.cpu().float()
-        return I
+        return I.mul_(self.static_phases_mask.to(device=I.device, dtype=I.dtype))
 
     def phases_from_currents(self, currents: torch.Tensor) -> torch.Tensor:
         """
@@ -548,15 +552,16 @@ class Mesh(torch.nn.Module, ABC):
         calibration = {
             "N": int(self.n_modes),
             "n_heaters": int(self.n_phases),
-            "static_phases": torch.remainder(static * sp_mask, 2 * torch.pi),
-            "xt_matrix": xtalk * xt_mask,
-            "nl_factor": nl_factor * sp_mask.to(nl_factor.device),
-            "sigma": param("sigma"),
+            "static_phases": torch.remainder(static * sp_mask, 2 * torch.pi).cpu().numpy(),
+            "xt_matrix": (xtalk * xt_mask).cpu().numpy(),
+            "nl_factor": (nl_factor * sp_mask.to(nl_factor.device)).cpu().numpy(),
+            "sigma": param("sigma").cpu().numpy(),
         }
 
         path = pathlib.Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(calibration, path)
+        with open(path, "wb") as f:
+            pickle.dump(calibration, f, protocol=pickle.HIGHEST_PROTOCOL)
 
         print(f"Calibration exported to {path}")
         return path
@@ -564,11 +569,11 @@ class Mesh(torch.nn.Module, ABC):
     def load_calibration(self, path: str | pathlib.Path) -> None:
         """Load a calibration file into an existing model, in place.
 
-        Reuses ``model.import_calibration``, so size checks and masking behave exactly as when
+        Reuses ``model.read_calibration``, so size checks and masking behave exactly as when
         passing ``calibration_file=`` to the constructor. For a linear model (``nonlinear=False``)
         the file's ``nl_factor`` is ignored and the model's is set to zero.
         """
-        static_phases, xtalk, nl_factor, sigma = self.import_calibration(str(path))
+        static_phases, xtalk, nl_factor, sigma = self.read_calibration(str(path))
 
         with torch.no_grad():
             for param, value in (
@@ -577,8 +582,7 @@ class Mesh(torch.nn.Module, ABC):
                 (self.nl_factor, nl_factor),
                 (self.sigma, sigma),
             ):
-                param.copy_(torch.from_numpy(np.asarray(value)).to(device=param.device, dtype=param.dtype))
-
+                param.copy_(torch.from_numpy(np.asarray(value)).to(device=self.device, dtype=param.dtype))
         print(f"Calibration loaded from {path}")
 
 
@@ -910,7 +914,9 @@ class Clements(Mesh):
             U = torch.mm(Ms[l], U.reshape(N, B * N)).view(N, B, N)
         return U.permute(1, 0, 2)
 
-    def phases_from_U(self, U_target: torch.Tensor, target_infidelity: float = 1e-6, **kwargs) -> torch.Tensor:
+    def phases_from_U(
+        self, U_target: torch.Tensor, target_infidelity: float = 1e-6, verbose: bool = False, **kwargs
+    ) -> torch.Tensor:
         """
         Decomposes a target unitary matrix into the phases of the Clements mesh.
 
@@ -920,13 +926,15 @@ class Clements(Mesh):
             Target unitary matrix. Shape (n_modes, n_modes) or (B, n_modes, n_modes).
         target_infidelity : float, optional
             Target infidelity threshold. Default is 1e-6.
+        verbose : bool, optional
+            Flag for printing decomposition information. Default is False.
 
         Returns
         -------
         torch.Tensor
             Tensor of phases matching the mesh configuration.
         """
-        _, Tlist = self.decompose(U=U_target, tol=target_infidelity)
+        _, Tlist = self.decompose(U=U_target, tol=target_infidelity, verbose=verbose)
 
         th = torch.stack([t.theta for t in Tlist], dim=1)
         ph = torch.stack([t.phi for t in Tlist], dim=1)
@@ -1197,6 +1205,7 @@ class Clements(Mesh):
         self,
         U: torch.Tensor,
         tol: float = 1e-11,
+        verbose: bool = False,
     ) -> tuple[torch.Tensor, list[MZIOp]]:
         """
         Batched Clements decomposition of a unitary matrix batch.
@@ -1240,6 +1249,8 @@ class Clements(Mesh):
         right_ops : list[MZIOp]
             All MZI ops in application order. Reconstruct with
             ``U = D @ T_K @ ... @ T_1`` (reversed, using ``mzi_matrix`` not dag).
+        verbose : bool, optional
+            Flag for printing decomposition information. Default is False.
 
         Raises
         ------
@@ -1264,6 +1275,9 @@ class Clements(Mesh):
         start_idx = 0
         end_idx = self.n_phases // 2 - 1
 
+        if verbose:
+            print(f"[{'INFO':<7}] Beginning unitary decomposition...")
+
         global_counter = 0
         for k, i in enumerate(range(N - 2, -1, -1)):
             if k % 2 == 0:  # RIGHT ops: zero W[row, col] via  W <- W @ T(col, col+1)^dag
@@ -1271,11 +1285,9 @@ class Clements(Mesh):
                     row, col = i + j + 1, j
                     idx = start_idx + (self.n_modes // 2 - 1) * counter
                     sigma = self.sigma[idx]
-                    # print(f"R index: {idx}")
                     theta, phi = self._phases_null_right(row, col, W, sigma)
                     right_ops.append(MZIOp(m=col, n=col + 1, theta=theta, phi=phi, sigma=sigma, index=idx))
 
-                    # old_val = W[:, row, col].item()
                     W = torch.bmm(W, self.mzi_matrix_dag(m=col, n=col + 1, theta=theta, phi=phi, sigma=sigma, N=N))
                     global_counter += 1
 
@@ -1286,11 +1298,9 @@ class Clements(Mesh):
                     row, col = i + j, j
                     idx = end_idx - (self.n_modes // 2 - 1) * counter
                     sigma = self.sigma[idx]
-                    # print(f"L index: {idx}")
                     theta, phi = self._phases_null_left(row, col, W, sigma)
                     left_ops.append(MZIOp(m=row, n=row + 1, theta=theta, phi=phi, sigma=sigma, index=idx))
 
-                    # old_val = W[:, row + 1, col].item()
                     W = torch.bmm(self.mzi_matrix(m=row, n=row + 1, theta=theta, phi=phi, sigma=sigma, N=N), W)
                     global_counter += 1
 
@@ -1299,12 +1309,13 @@ class Clements(Mesh):
         # Check if W is diagonal
         diff = torch.abs(W - torch.diag_embed(torch.diagonal(W, dim1=-2, dim2=-1)))
         is_non_diagonal = (diff > 1e-12).any(dim=(-2, -1))
-        non_diag_indices = torch.where(is_non_diagonal)[0]
+        n_non_diag = is_non_diagonal[is_non_diagonal == True].numel()
 
-        if non_diag_indices.numel() > 0:
-            print(f"  Found {len(non_diag_indices)} non-diagonal matrices at indices")
-        else:
-            print("  All matrices are diagonal")
+        if verbose:
+            if n_non_diag:
+                print(f"[{'WARNING':<7}] Reachability check failed\n{'':<10}{n_non_diag} of {B} matrices are unreachable (splitting ratio imperfections).")
+            else:
+                print(f"[{'INFO':<7}] Reachability check passed: all {B} matrices are reachable.")
 
         # W is diagonal, convert each LEFT op into an equivalent RIGHT op (batch).
         for op in reversed(left_ops):
@@ -1318,6 +1329,9 @@ class Clements(Mesh):
             W = torch.bmm(W, self.mzi_matrix_dag(m=op.m, n=op.n, theta=op.theta, phi=phi_new, sigma=op.sigma, N=N))
 
             right_ops.append(MZIOp(m=op.m, n=op.n, theta=op.theta, phi=phi_new, sigma=op.sigma, index=op.index))
+
+        if verbose:
+            print(f"[{'INFO':<7}] Unitary decomposition completed.")
 
         return W, sorted(right_ops, key=lambda x: x.index)
 
