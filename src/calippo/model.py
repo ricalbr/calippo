@@ -914,8 +914,9 @@ class Clements(Mesh):
             U = torch.mm(Ms[l], U.reshape(N, B * N)).view(N, B, N)
         return U.permute(1, 0, 2)
 
-    def phases_from_U(self, U_target: torch.Tensor, target_infidelity: float = 1e-6, verbose:bool = False,
-                      **kwargs) -> torch.Tensor:
+    def phases_from_U(
+        self, U_target: torch.Tensor, target_infidelity: float = 1e-6, verbose: bool = False, **kwargs
+    ) -> torch.Tensor:
         """
         Decomposes a target unitary matrix into the phases of the Clements mesh.
 
