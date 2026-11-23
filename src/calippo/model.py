@@ -647,12 +647,12 @@ class Clements(Mesh):
         """
 
         # Generate static_phases_mask
-        static_phases_mask = torch.ones(self.n_phases, dtype=torch.bool)
+        static_phases_mask = torch.ones(self.n_phases, device=self.device, dtype=torch.bool)
         half_idx = self.n_phases // 2
         static_phases_mask[half_idx : half_idx + self.n_modes - 1] = False
 
         # Initialize xtalk_mask
-        xtalk_mask = torch.zeros((self.n_phases, self.n_phases), dtype=torch.bool)
+        xtalk_mask = torch.zeros((self.n_phases, self.n_phases), device=self.device, dtype=torch.bool)
 
         # Calculate main blocks for the first M rows (Thetas)
         mzi = self.n_modes * (self.n_modes - 1) // 2
