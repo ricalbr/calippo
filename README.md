@@ -1,8 +1,6 @@
 # calippo
-CALIbration of Photonics PrOcessors
+**CALI**bration of **P**hotonics **P**r**O**cessors
 
-- [Installation](#installation)
-- [Issues](#issues)
 
 ## Installation
 The package can be installed using `pip` (Python version `3.11` or above is suggested)
