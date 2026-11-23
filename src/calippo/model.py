@@ -509,7 +509,7 @@ class Mesh(torch.nn.Module, ABC):
         if self.phase_map is not None:
             xt_active = self.phase_map @ xt_active
             sp_active = self.phase_map @ sp_active
-        phases = torch.addmm(sp_active, I2, xt_active.T)
+        phases = torch.addmm(sp_active, I2.to(self.device), xt_active.T)
 
         # update the mixing layer matrix
         if self.unbalanced_beam_splitters:
