@@ -563,7 +563,7 @@ class Mesh(torch.nn.Module, ABC):
         with open(path, "wb") as f:
             pickle.dump(calibration, f, protocol=pickle.HIGHEST_PROTOCOL)
 
-        print(f"Calibration exported to {path}")
+        print(f"Calibration exported to {path}.")
         return path
 
     def load_calibration(self, path: str | pathlib.Path) -> None:
