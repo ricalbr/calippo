@@ -109,7 +109,10 @@ class Mesh(torch.nn.Module, ABC):
             self.register_buffer("M", self._compute_mixing_layer(), persistent=False)
 
         # Move all the parameters and buffers to the selected device
-        self.to(get_device(device))
+        dev = get_device(device)
+        self.to(dev)
+        self.static_phases_mask = self.static_phases_mask.to(dev)
+        self.xtalk_mask = self.xtalk_mask.to(dev)
 
         # Output
         on = lambda flag: "Enabled" if flag else "Disabled"
@@ -647,12 +650,12 @@ class Clements(Mesh):
         """
 
         # Generate static_phases_mask
-        static_phases_mask = torch.ones(self.n_phases, device=self.device, dtype=torch.bool)
+        static_phases_mask = torch.ones(self.n_phases, dtype=torch.bool)
         half_idx = self.n_phases // 2
         static_phases_mask[half_idx : half_idx + self.n_modes - 1] = False
 
         # Initialize xtalk_mask
-        xtalk_mask = torch.zeros((self.n_phases, self.n_phases), device=self.device, dtype=torch.bool)
+        xtalk_mask = torch.zeros((self.n_phases, self.n_phases), dtype=torch.bool)
 
         # Calculate main blocks for the first M rows (Thetas)
         mzi = self.n_modes * (self.n_modes - 1) // 2
