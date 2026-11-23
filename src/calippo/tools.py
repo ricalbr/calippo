@@ -67,12 +67,7 @@ def sinkhorn(
     D_out : torch.Tensor
         Left diagonal scaling factors.
     """
-    # Promote single tensor to batch dimension if 2D
-    is_2d = U.ndim == 2
-    if is_2d:
-        U_work = U.unsqueeze(0).clone().double()
-    else:
-        U_work = U.clone().double()
+    U_work = U.clone().double()
 
     B, N, _ = U_work.shape
     device = U.device
@@ -101,9 +96,6 @@ def sinkhorn(
 
     else:
         print(f"[WARNING] Sinkhorn did not converge within {max_iter} iterations.")
-
-    if is_2d:
-        return U_work[0].to(U.dtype), D_in[0].to(U.dtype), D_out[0].to(U.dtype)
 
     return U_work.to(U.dtype), D_in.to(U.dtype), D_out.to(U.dtype)
 
@@ -198,12 +190,6 @@ def make_real_border(U: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch
     D_right : torch.Tensor
         The right diagonal unitary correction tensor (or batch).
     """
-    # Check dimension to guarantee vectorial shape
-    is_2d = U.ndim == 2
-    if is_2d:
-        U = U.unsqueeze(0)
-
-    B, N, _ = U.shape
 
     # D_right calculation: first row phase cancellation
     # Extract phases of the first row: (B, N)
@@ -220,9 +206,6 @@ def make_real_border(U: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch
 
     # Apply D_left: (B, N_diag, N) @ (B, N, N)
     R = U1 * D_left.unsqueeze(2)
-
-    if is_2d:
-        return R[0], torch.diag(D_left[0]), torch.diag(D_right[0])
 
     # Return as diagonal matrices for consistency with previous 2D implementation
     # Note: Using torch.diag_embed for batch-wise diagonal creation
@@ -252,8 +235,7 @@ def get_haar_unitary(size: int, batch_size: int = 1, device: Optional[torch.devi
         A complex NxN Haar-random unitary tensor (shape (N, N) if batch_size=1,
         or shape (B, N, N) if batch_size > 1).
     """
-    if device is None:
-        device = torch.device("cpu")
+    device = get_device(device)
 
     # Generate random complex tensors: (B, N, N).
     # Using standard normal distribution for real and imaginary parts
@@ -275,7 +257,6 @@ def get_haar_unitary(size: int, batch_size: int = 1, device: Optional[torch.devi
 
     # Apply phases: Q @ diag(phases)
     Q *= phases.unsqueeze(1)
-
     return Q
 
 
@@ -322,6 +303,9 @@ def clements_xtalk_sign(n_modes: int, dtype: torch.dtype = torch.int8) -> torch.
     torch.Tensor, shape (n_modes * (n_modes - 1), n_modes * (n_modes - 1))
         The sign matrix, with the phase ordering of ``clements_shifters``.
     """
+    if not isinstance(n_modes, int) or n_modes < 2:
+        raise ValueError(f"n_modes must be an integer >= 2, got {n_modes!r}.")
+
     # The first two columns of external phase shifters (N - 1 shifters in total) only set the phases of the input
     # modes: they do not affect the measured intensities, so they are not part of the cross-talk model.
     unused_external_cols = 2
