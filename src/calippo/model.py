@@ -109,7 +109,7 @@ class Mesh(torch.nn.Module, ABC):
             self.register_buffer("M", self._compute_mixing_layer(), persistent=False)
 
         # Move all the parameters and buffers to the selected device
-        self.to(get_device(device))
+        self.to(get_device(device))  # moves parameters and every registered buffer (masks, M, lookup tables)
 
         # Output
         on = lambda flag: "Enabled" if flag else "Disabled"
@@ -499,6 +499,8 @@ class Mesh(torch.nn.Module, ABC):
         pass
 
     def forward(self, currents):
+        currents = currents.to(device=self.xtalk.device, dtype=self.xtalk.dtype)
+
         # Mask gradients to enforce physical parameters and prevent optimizer artifacts.
         sp_active = self.static_phases * self.static_phases_mask  # type: ignore[operator]
         xt_active = self.xtalk * self.xtalk_mask  # type: ignore[operator]
@@ -582,7 +584,9 @@ class Mesh(torch.nn.Module, ABC):
                 (self.nl_factor, nl_factor),
                 (self.sigma, sigma),
             ):
-                param.copy_(torch.from_numpy(np.asarray(value)).to(device=self.device, dtype=param.dtype))
+                param.copy_(value)  # copy_ converts device and dtype by itself
+            self.M = self._compute_mixing_layer()  # sigma may have changed
+            self._M_key = None
         print(f"Calibration loaded from {path}")
 
 
@@ -811,7 +815,9 @@ class Clements(Mesh):
         torch.Tensor
             Tensor of matrices M (2N, N, N).
         """
-        BS = self._bs_tensor(self.sigma)
+        # A balanced chip has a fixed sigma = pi/4: it is not trained, and ``forward`` never rebuilds M.
+        sigma = self.sigma if self.unbalanced_beam_splitters else self.sigma.detach()
+        BS = self._bs_tensor(sigma)
 
         eye_1 = torch.eye(1, device=self.device, dtype=torch.complex128)
         cycle = [self.n_modes // 2, self.n_modes // 2 - 1]
@@ -1633,7 +1639,7 @@ class Bell(Mesh):
         # Output for debug
         if plot_graph:
             fig, ax = plt.subplots()
-            ax.semilogy((1 - fidelity_monitor.detach().numpy()).T)
+            ax.semilogy((1 - fidelity_monitor.detach().cpu().numpy()).T)
             ax.set_xlabel("Iteration number")
             ax.set_ylabel("Infidelity")
             ax.set_title("Decomposition convergence diagram")
