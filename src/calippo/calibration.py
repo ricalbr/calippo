@@ -418,9 +418,8 @@ class TrainingPipeline:
                     periodic_fixes += 1
                     print(f"XT FIX [periodic] - Found {n_ill} ill-elements in cross-talk matrix.")
                     epochs_no_improve = 0
-
-            # Evaluation & Curriculum
-            if current_epoch % self.config.check_interval == 0 and current_epoch != 0:
+            # Evaluation & Curriculum learning only if not periodic xtalk fix occurred
+            elif current_epoch % self.config.check_interval == 0 and current_epoch != 0:
                 current_time = time.perf_counter()
                 elapsed_time = current_time - start_time
                 start_time = current_time
