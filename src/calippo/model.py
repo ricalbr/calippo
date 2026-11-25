@@ -1668,23 +1668,26 @@ if __name__ == "__main__":
         # Initialize the processor activating the non-linear model
         processor = Clements(n_modes=n, non_linear=True, unbalanced_beam_splitters=True)
 
-        print(" Decomposition ".center(55, '-'))
-
         # Generate a batch of Haar random unitaries (and make them "real-bordered")
         u_target_raw = get_haar_unitary(n, batch_size)
         u_target, _, _ = make_real_border(u_target_raw)
 
         # Decomposition and Current-from-Phases Calculation
+        print(" Decomposition ".center(55, '-'))
         start_t = time.perf_counter()
         phases_target = processor.phases_from_U(u_target, plot_graph=True)
         currents_target = processor.currents_from_phases(phases_target)
         print(f"  Batch size: {batch_size}\n" f"  Matrix-to-currents in {time.perf_counter()-start_t:.3f} s")
 
         # Experimental matrix retrieval
+        print(" Propagation ".center(55, '-'))
+        start_t = time.perf_counter()
+        phases_exp = processor.phases_from_currents(currents_target)
         u_exp_raw = processor.U_from_phases(phases_target)
-        u_exp, _, _ = make_real_border(u_exp_raw)
+        print(f"  Batch size: {batch_size}\n" f"  Currents-to-matrix in {time.perf_counter()-start_t:.3f} s")
 
         # Fidelity Calculation
+        u_exp, _, _ = make_real_border(u_exp_raw)
         fids = fidelity(u_target, u_exp)
 
         print(" Fidelity calculation ".center(55, '-'))
