@@ -1269,13 +1269,13 @@ class Clements(Mesh):
         B, _, N = U.shape
 
         # Unitarity check: U @ U^dag ~= I
-        UUd = torch.bmm(U, torch.adjoint(U))
+        UUd = torch.bmm(U, torch.adjoint(U)).to(torch.complex128)
         I = torch.eye(N, dtype=torch.complex128, device=U.device).unsqueeze(0).repeat(B, 1, 1)
 
         if not torch.allclose(UUd, I, atol=tol, rtol=0):
             raise ValueError("One or more matrices in the batch are not unitary.")
 
-        W: torch.Tensor = U.clone().detach()
+        W: torch.Tensor = U.clone().detach().to(torch.complex128)
         right_ops: list[MZIOp] = []  # ops applied as  W <- W @ T^dag
         left_ops: list[MZIOp] = []  # ops applied as  W <- T  @ W
 
@@ -1296,7 +1296,7 @@ class Clements(Mesh):
                     theta, phi = self._phases_null_right(row, col, W, sigma)
                     right_ops.append(MZIOp(m=col, n=col + 1, theta=theta, phi=phi, sigma=sigma, index=idx))
 
-                    W = torch.bmm(W, self.mzi_matrix_dag(m=col, n=col + 1, theta=theta, phi=phi, sigma=sigma, N=N))
+                    W = torch.bmm(W, self.mzi_matrix_dag(m=col, n=col + 1, theta=theta, phi=phi, sigma=sigma, N=N)).to(torch.complex128)
                     global_counter += 1
 
                 start_idx += 1
@@ -1309,7 +1309,7 @@ class Clements(Mesh):
                     theta, phi = self._phases_null_left(row, col, W, sigma)
                     left_ops.append(MZIOp(m=row, n=row + 1, theta=theta, phi=phi, sigma=sigma, index=idx))
 
-                    W = torch.bmm(self.mzi_matrix(m=row, n=row + 1, theta=theta, phi=phi, sigma=sigma, N=N), W)
+                    W = torch.bmm(self.mzi_matrix(m=row, n=row + 1, theta=theta, phi=phi, sigma=sigma, N=N), W).to(torch.complex128)
                     global_counter += 1
 
                 end_idx -= 1
@@ -1328,13 +1328,13 @@ class Clements(Mesh):
         # W is diagonal, convert each LEFT op into an equivalent RIGHT op (batch).
         for op in reversed(left_ops):
             # Undo the left application
-            W = torch.bmm(self.mzi_matrix_dag(m=op.m, n=op.n, theta=op.theta, phi=op.phi, sigma=op.sigma, N=N), W)
+            W = torch.bmm(self.mzi_matrix_dag(m=op.m, n=op.n, theta=op.theta, phi=op.phi, sigma=op.sigma, N=N), W).to(torch.complex128)
 
             # Compute phi_new that re-zeroes W[m, n] via a right op
             phi_new = self._push_left_to_right(m=op.m, n=op.n, W=W, theta=op.theta, sigma=op.sigma)
 
             # Apply the equivalent right op
-            W = torch.bmm(W, self.mzi_matrix_dag(m=op.m, n=op.n, theta=op.theta, phi=phi_new, sigma=op.sigma, N=N))
+            W = torch.bmm(W, self.mzi_matrix_dag(m=op.m, n=op.n, theta=op.theta, phi=phi_new, sigma=op.sigma, N=N)).to(torch.complex128)
 
             right_ops.append(MZIOp(m=op.m, n=op.n, theta=op.theta, phi=phi_new, sigma=op.sigma, index=op.index))
 
