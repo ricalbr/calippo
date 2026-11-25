@@ -401,28 +401,30 @@ class Mesh(torch.nn.Module, ABC):
         solution of xtalk @ I2 = target (with 2*pi phase corrections) lies in [0, num].
         Returns the I2 solution for the best feasible num.
         """
-        TWO_PI = torch.tensor(2 * torch.pi, dtype=torch.float64, device=target_diff.device)
+        two_pi = 2 * torch.pi
 
-        I2_eff = torch.linalg.solve(xtalk, target_diff)
+        # xtalk is fixed, so factorize once and reuse for every solve
+        LU, piv = torch.linalg.lu_factor(xtalk)
 
-        num_ok = float(I2_eff.mean()) ** 2
-        num_ko = float(I2_eff.mean() * 0.1) ** 2
+        I2_eff = torch.linalg.lu_solve(LU, piv, target_diff)
+
+        mean_I2 = I2_eff.mean()
+        num_ok = float(mean_I2) ** 2
+        num_ko = float(mean_I2 * 0.1) ** 2
 
         best_I2 = None
         for _ in range(n_bisect):
             num = (num_ok + num_ko) / 2
-            target = target_diff.clone()
-            I2 = I2_eff.clone()
+            target, I2 = target_diff, I2_eff
 
-            it = 0
-            while ((I2 < 0) | (I2 > num)).any() and it < max_iter:
-                negative = I2 < 0
-                exceeds = I2 > num
-                target = target + negative.to(target.dtype) * TWO_PI - exceeds.to(target.dtype) * TWO_PI
-                I2 = torch.linalg.solve(xtalk, target)
-                it += 1
+            for _ in range(max_iter):
+                if not ((I2 < 0) | (I2 > num)).any():
+                    break
+                # +2pi where below 0, -2pi where above num
+                target = target + two_pi * ((I2 < 0).to(target.dtype) - (I2 > num).to(target.dtype))
+                I2 = torch.linalg.lu_solve(LU, piv, target)
+
             feasible = bool(((I2 >= 0) & (I2 <= num)).all())
-
             if feasible:
                 num_ok = num
                 best_I2 = I2
@@ -1660,7 +1662,7 @@ if __name__ == "__main__":
 
     try:
         n = 24
-        batch_size = 100
+        batch_size = 1000
         plot = True
 
         # Initialize the processor activating the non-linear model
