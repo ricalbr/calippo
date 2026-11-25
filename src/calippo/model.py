@@ -1209,6 +1209,7 @@ class Clements(Mesh):
 
         return torch.remainder(phi_new, 2 * torch.pi)
 
+    @torch.no_grad()
     def decompose(
         self,
         U: torch.Tensor,
