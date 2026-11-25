@@ -578,7 +578,7 @@ def load_data(
     with open(data_filepath, "rb") as f:
         data = pickle.load(f)
         u_th = data["u_the"]
-        u_exp = data["u_exp"].transpose(1, 2)
+        u_exp = data["u_exp"]
         currents = data["currents"]
 
     total_samples = len(currents)
