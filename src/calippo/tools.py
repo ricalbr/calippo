@@ -7,10 +7,11 @@ fidelity metrics, random unitary generation and other. PyTorch tensor-based
 implementation supporting batched operations.
 """
 
-from typing import Optional, Tuple
+from __future__ import annotations
 
 import numpy as np
 import torch
+import math
 
 
 def get_device(device: str | torch.device | None = None) -> torch.device:
@@ -35,10 +36,9 @@ def get_device(device: str | torch.device | None = None) -> torch.device:
         device = torch.device("cpu")
     return device
 
-
 def sinkhorn(
     U: torch.Tensor, tol: float = 1e-6, max_iter: int = 1000
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Normalize a (batch of) positive tensors using the Sinkhorn–Knopp algorithm.
 
@@ -67,38 +67,39 @@ def sinkhorn(
     D_out : torch.Tensor
         Left diagonal scaling factors.
     """
-    U_work = U.clone().double()
+    W = U.to(torch.float64, copy=True)
+    B, N, _ = W.shape
 
-    B, N, _ = U_work.shape
-    device = U.device
+    # accumulated scalings: U_norm = diag(row_acc) @ U @ diag(col_acc)
+    row_acc = torch.ones(B, N, dtype=torch.float64, device=W.device)
+    col_acc = torch.ones(B, N, dtype=torch.float64, device=W.device)
 
-    D_in = torch.ones((B, N), dtype=torch.float64, device=device)
-    D_out = torch.ones((B, N), dtype=torch.float64, device=device)
+    converged = False
+    for _ in range(max_iter):
+        # column sums -> (B, N)
+        t_col = 1.0 / W.sum(dim=1)
+        W = W * t_col.unsqueeze(1)
+        col_acc *= t_col
 
-    for i in range(max_iter):
-        # Column normalization
-        col_sums = torch.sum(U_work, dim=1)
-        T_in = 1.0 / col_sums
-        U_work = U_work * T_in.unsqueeze(1)
-        D_in *= T_in
+        # rows sums -> (B, N)
+        t_row = 1.0 / W.sum(dim=2)
+        W = W * t_row.unsqueeze(2)
+        row_acc *= t_row
 
-        # Row normalization
-        row_sums = torch.sum(U_work, dim=2)
-        T_out = 1.0 / row_sums
-        U_work = T_out.unsqueeze(2) * U_work
-        D_out *= T_out
-
-        # Check convergence
-        err_col = torch.max(torch.abs(1 - col_sums))
-        err_row = torch.max(torch.abs(1 - row_sums))
-        if max(err_col.item(), err_row.item()) < tol:
+        # rows are exact after the row step; check column residual only.
+        err = (1.0 - W.sum(dim=1)).abs().amax()    # single host sync
+        if err.item() < tol:
+            converged = True
             break
 
-    else:
+    if not converged:
         print(f"[WARNING] Sinkhorn did not converge within {max_iter} iterations.")
 
-    return U_work.to(U.dtype), D_in.to(U.dtype), D_out.to(U.dtype)
+    W = W.to(U.dtype)
+    D_out = (1.0 / row_acc).to(U.dtype)
+    D_in = (1.0 / col_acc).to(U.dtype)
 
+    return W, D_in, D_out
 
 def amplitude_fidelity(U_target: torch.Tensor, U_exp: torch.Tensor) -> torch.Tensor:
     """
@@ -167,7 +168,7 @@ def fidelity(U_target: torch.Tensor, U_exp: torch.Tensor) -> torch.Tensor:
     return fid[0] if is_2d else fid
 
 
-def make_real_border(U: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def make_real_border(U: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Make a unitary tensor or batch of tensors "real-bordered".
 
@@ -191,31 +192,20 @@ def make_real_border(U: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch
         The right diagonal unitary correction tensor (or batch).
     """
 
-    # D_right calculation: first row phase cancellation
-    # Extract phases of the first row: (B, N)
-    row_phases = torch.angle(U[:, 0, :])
-    D_right = torch.exp(-1j * row_phases)  # (B, N)
+    # Right phases from the first row: multiplies columns.
+    ph_right = U[:, 0, :] / U[:, 0, :].abs().clamp_min(torch.finfo(U.real.dtype).tiny)
+    U1 = U * ph_right.conj().unsqueeze(1)
 
-    # Apply D_right: (B, N, N) @ (B, N, N_diag)
-    U1 = U * D_right.unsqueeze(1)
+    # Left phases from the first column of U1: multiplies rows.
+    ph_left = U1[:, :, 0] / U1[:, :, 0].abs().clamp_min(torch.finfo(U.real.dtype).tiny)
+    R = U1 * ph_left.conj().unsqueeze(2)
 
-    # D_left calculation: first column phase cancellation
-    # Extract phases of the first column: (B, N)
-    col_phases = torch.angle(U1[:, :, 0])
-    D_left = torch.exp(-1j * col_phases)  # (B, N)
+    # Factors satisfying U = D_left @ R @ D_right.
+    D_left = torch.diag_embed(ph_left)
+    D_right = torch.diag_embed(ph_right)
+    return R, D_left, D_right
 
-    # Apply D_left: (B, N_diag, N) @ (B, N, N)
-    R = U1 * D_left.unsqueeze(2)
-
-    # Return as diagonal matrices for consistency with previous 2D implementation
-    # Note: Using torch.diag_embed for batch-wise diagonal creation
-    D_left_mat = torch.diag_embed(D_left)
-    D_right_mat = torch.diag_embed(D_right)
-
-    return R, D_left_mat, D_right_mat
-
-
-def get_haar_unitary(size: int, batch_size: int = 1, device: Optional[torch.device] = None) -> torch.Tensor:
+def get_haar_unitary(size: int, batch_size: int = 1, device: torch.device | None = None, seed: int | None = None) -> torch.Tensor:
     """
     Generate a batch of Haar-distributed unitary tensors using QR decomposition.
     This avoids Python loops by leveraging PyTorch's vectorized QR.
@@ -226,8 +216,11 @@ def get_haar_unitary(size: int, batch_size: int = 1, device: Optional[torch.devi
         The dimension N of the NxN unitary tensor.
     batch_size : int, optional
         The number of tensors to generate. Defaults to 1.
-    device: torch.device, optional
+    device : torch.device, optional
         The device to initialize the tensors on.
+    seed : int, optional
+        The seed for the generation of random Haar matrices.
+        Default seed is None, no seed is applied, the unitaries changes at each function call.
 
     Returns
     -------
@@ -237,28 +230,21 @@ def get_haar_unitary(size: int, batch_size: int = 1, device: Optional[torch.devi
     """
     device = get_device(device)
 
-    # Generate random complex tensors: (B, N, N).
-    # Using standard normal distribution for real and imaginary parts
-    X = (
-        torch.randn(batch_size, size, size, dtype=torch.float64, device=device)
-        + 1j * torch.randn(batch_size, size, size, dtype=torch.float64, device=device)
-    ) / np.sqrt(2)
+    gen = torch.Generator(device=device)
+    if seed is None:
+        gen.seed()
+    else:
+        gen.manual_seed(seed)
 
-    # QR decomposition (vectorized over the first dimension)
-    # torch.linalg.qr returns Q and R. Q is unitary.
+    # Complex Ginibre matrix: real and imaginary parts ~ N(0, 1/2).
+    re, im = torch.randn(2, batch_size, size, size, generator=gen, dtype=torch.float64, device=device)
+    X = torch.complex(re, im) / math.sqrt(2)
+
     Q, R = torch.linalg.qr(X)
 
-    # Adjust for Haar measure.
-    # The QR decomposition gives a unitary Q, but the sign/phase of the
-    # columns might be arbitrary. We multiply by the phase of the diagonal of R
-    # to ensure the distribution is uniquely Haar.
-    phases = torch.diagonal(R, dim1=1, dim2=2)
-    phases = phases / torch.abs(phases)
-
-    # Apply phases: Q @ diag(phases)
-    Q *= phases.unsqueeze(1)
-    return Q
-
+    # Fix the column phases using diag(R) so the distribution is Haar.
+    d = torch.diagonal(R, dim1=-2, dim2=-1)
+    return Q * (d / d.abs()).unsqueeze(-2)
 
 def clements_xtalk_sign(n_modes: int, dtype: torch.dtype = torch.int8) -> torch.Tensor:
     """
