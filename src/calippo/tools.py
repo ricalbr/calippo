@@ -67,12 +67,12 @@ def sinkhorn(
     D_out : torch.Tensor
         Left diagonal scaling factors.
     """
-    W = U.to(torch.float64, copy=True)
+    W = U.to(U.dtype, copy=True)
     B, N, _ = W.shape
 
     # accumulated scalings: U_norm = diag(row_acc) @ U @ diag(col_acc)
-    row_acc = torch.ones(B, N, dtype=torch.float64, device=W.device)
-    col_acc = torch.ones(B, N, dtype=torch.float64, device=W.device)
+    row_acc = torch.ones(B, N, dtype=W.dtype, device=W.device)
+    col_acc = torch.ones(B, N, dtype=W.dtype, device=W.device)
 
     converged = False
     for _ in range(max_iter):
@@ -205,7 +205,7 @@ def make_real_border(U: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch
     D_right = torch.diag_embed(ph_right)
     return R, D_left, D_right
 
-def get_haar_unitary(size: int, batch_size: int = 1, device: torch.device | None = None, seed: int | None = None) -> torch.Tensor:
+def get_haar_unitary(size: int, batch_size: int = 1, device: torch.device | None = None, dtype: torch.dtype = torch.float64, seed: int | None = None) -> torch.Tensor:
     """
     Generate a batch of Haar-distributed unitary tensors using QR decomposition.
     This avoids Python loops by leveraging PyTorch's vectorized QR.
@@ -218,6 +218,8 @@ def get_haar_unitary(size: int, batch_size: int = 1, device: torch.device | None
         The number of tensors to generate. Defaults to 1.
     device : torch.device, optional
         The device to initialize the tensors on.
+    dtype : torch.dtype, optional
+        The data type (real) used for the unitary. Deafult is torch.float64.
     seed : int, optional
         The seed for the generation of random Haar matrices.
         Default seed is None, no seed is applied, the unitaries changes at each function call.
@@ -228,8 +230,8 @@ def get_haar_unitary(size: int, batch_size: int = 1, device: torch.device | None
         A complex NxN Haar-random unitary tensor (shape (N, N) if batch_size=1,
         or shape (B, N, N) if batch_size > 1).
     """
-    device = get_device(device)
-
+    device = get_device(device) 
+    
     gen = torch.Generator(device=device)
     if seed is None:
         gen.seed()
@@ -237,7 +239,7 @@ def get_haar_unitary(size: int, batch_size: int = 1, device: torch.device | None
         gen.manual_seed(seed)
 
     # Complex Ginibre matrix: real and imaginary parts ~ N(0, 1/2).
-    re, im = torch.randn(2, batch_size, size, size, generator=gen, dtype=torch.float64, device=device)
+    re, im = torch.randn(2, batch_size, size, size, generator=gen, dtype=dtype, device=device)
     X = torch.complex(re, im) / math.sqrt(2)
 
     Q, R = torch.linalg.qr(X)
@@ -282,7 +284,7 @@ def clements_xtalk_sign(n_modes: int, dtype: torch.dtype = torch.int8) -> torch.
     n_modes : int
         Number of optical modes (>= 2).
     dtype : torch.dtype, optional
-        Output dtype. Default is torch.int8; use torch.float64 to multiply directly with the model parameters.
+        Output dtype. Default is torch.int8; use torch.float64/torch.float32 to multiply directly with the model parameters.
 
     Returns
     -------
@@ -334,7 +336,7 @@ if __name__ == "__main__":
     try:
         # Configuration
         size = 24
-        batch_size = 100
+        batch_size = 1000
         noise_intensity = 0.1
 
         # HAAR VALIDATION
