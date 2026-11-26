@@ -395,7 +395,7 @@ class Mesh(torch.nn.Module, ABC):
 
     @staticmethod
     @torch.no_grad()
-    def minimize_currents(target_diff, xtalk, max_iter=20, n_bisect=50):
+    def minimize_currents(target_diff, xtalk, max_iter=20, n_bisect=50, rtol=1e-3):
         """
         Bisection on the upper bound `num`: find the smallest num such that the
         solution of xtalk @ I2 = target (with 2*pi phase corrections) lies in [0, num].
@@ -403,10 +403,10 @@ class Mesh(torch.nn.Module, ABC):
         """
         two_pi = 2 * torch.pi
 
-        # xtalk is fixed, so factorize once and reuse for every solve
-        LU, piv = torch.linalg.lu_factor(xtalk)
-
-        I2_eff = torch.linalg.lu_solve(LU, piv, target_diff)
+        # xtalk is fixed, so invert once and reuse for every solve
+        xtalk_inv = torch.linalg.inv(xtalk)
+        
+        I2_eff = xtalk_inv @ target_diff
 
         mean_I2 = I2_eff.mean()
         num_ok = float(mean_I2) ** 2
@@ -422,7 +422,7 @@ class Mesh(torch.nn.Module, ABC):
                     break
                 # +2pi where below 0, -2pi where above num
                 target = target + two_pi * ((I2 < 0).to(target.dtype) - (I2 > num).to(target.dtype))
-                I2 = torch.linalg.lu_solve(LU, piv, target)
+                I2 = xtalk_inv @ target
 
             feasible = bool(((I2 >= 0) & (I2 <= num)).all())
             if feasible:
@@ -430,6 +430,10 @@ class Mesh(torch.nn.Module, ABC):
                 best_I2 = I2
             else:
                 num_ko = num
+
+            # num is already known to the required precision: further halvings change nothing in practice
+            if best_I2 is not None and num_ok - num_ko <= rtol * num_ok:
+                break
 
         if best_I2 is None:
             raise RuntimeError("No feasible solution found: increase num_ok or max_iter")
@@ -810,7 +814,7 @@ class Clements(Mesh):
     def _compute_mixing_layer(self) -> torch.Tensor:
         """
         Generate the static mixing layers (directional couplers) for the Clements
-        architecture. Phase shift layer are excluded.
+        architecture. Phase shift layers are excluded.
 
         Returns
         -------
@@ -1684,7 +1688,7 @@ if __name__ == "__main__":
         print(" Propagation ".center(55, '-'))
         start_t = time.perf_counter()
         phases_exp = processor.phases_from_currents(currents_target)
-        u_exp_raw = processor.U_from_phases(phases_target)
+        u_exp_raw = processor.U_from_phases(phases_exp)
         print(f"  Batch size: {batch_size}\n" f"  Currents-to-matrix in {time.perf_counter()-start_t:.3f} s")
 
         # Fidelity Calculation
