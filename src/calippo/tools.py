@@ -9,9 +9,10 @@ implementation supporting batched operations.
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import torch
-import math
 
 
 def get_device(device: str | torch.device | None = None) -> torch.device:
