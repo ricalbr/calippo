@@ -36,6 +36,7 @@ def get_device(device: str | torch.device | None = None) -> torch.device:
         device = torch.device("cpu")
     return device
 
+
 def sinkhorn(
     U: torch.Tensor, tol: float = 1e-6, max_iter: int = 1000
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -87,7 +88,7 @@ def sinkhorn(
         row_acc *= t_row
 
         # rows are exact after the row step; check column residual only.
-        err = (1.0 - W.sum(dim=1)).abs().amax()    # single host sync
+        err = (1.0 - W.sum(dim=1)).abs().amax()  # single host sync
         if err.item() < tol:
             converged = True
             break
@@ -100,6 +101,7 @@ def sinkhorn(
     D_in = (1.0 / col_acc).to(U.dtype)
 
     return W, D_in, D_out
+
 
 def amplitude_fidelity(U_target: torch.Tensor, U_exp: torch.Tensor) -> torch.Tensor:
     """
@@ -205,7 +207,14 @@ def make_real_border(U: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch
     D_right = torch.diag_embed(ph_right)
     return R, D_left, D_right
 
-def get_haar_unitary(size: int, batch_size: int = 1, device: torch.device | None = None, dtype: torch.dtype = torch.float64, seed: int | None = None) -> torch.Tensor:
+
+def get_haar_unitary(
+    size: int,
+    batch_size: int = 1,
+    device: torch.device | None = None,
+    dtype: torch.dtype = torch.float64,
+    seed: int | None = None,
+) -> torch.Tensor:
     """
     Generate a batch of Haar-distributed unitary tensors using QR decomposition.
     This avoids Python loops by leveraging PyTorch's vectorized QR.
@@ -230,8 +239,8 @@ def get_haar_unitary(size: int, batch_size: int = 1, device: torch.device | None
         A complex NxN Haar-random unitary tensor (shape (N, N) if batch_size=1,
         or shape (B, N, N) if batch_size > 1).
     """
-    device = get_device(device) 
-    
+    device = get_device(device)
+
     gen = torch.Generator(device=device)
     if seed is None:
         gen.seed()
@@ -247,6 +256,7 @@ def get_haar_unitary(size: int, batch_size: int = 1, device: torch.device | None
     # Fix the column phases using diag(R) so the distribution is Haar.
     d = torch.diagonal(R, dim1=-2, dim2=-1)
     return Q * (d / d.abs()).unsqueeze(-2)
+
 
 def clements_xtalk_sign(n_modes: int, dtype: torch.dtype = torch.int8) -> torch.Tensor:
     """
@@ -313,8 +323,8 @@ def clements_xtalk_sign(n_modes: int, dtype: torch.dtype = torch.int8) -> torch.
 
     # Who interacts with whom
     last_unused_layer = 2 * (unused_external_cols - 1)
-    victim_to_bottom_layer = layer - 2 * (n_modes - 1 - mode)  # layer at which a victim's path reaches the bottom waveguide
-    reach = torch.clamp(victim_to_bottom_layer, min=last_unused_layer)[:, None]  # earliest layer a victim feels, per row
+    victim_to_bottom_layer = layer - 2 * (n_modes - 1 - mode)  # backward path from victim to bottom waveguide layer
+    reach = torch.clamp(victim_to_bottom_layer, min=last_unused_layer)[:, None]  # earliest layer a victim feels
 
     internal_victim = is_internal[:, None] & is_internal[None, :] & (victim_layer == aggressor_layer)
     external_victim = ~is_internal[:, None] & (reach <= aggressor_layer) & (aggressor_layer <= victim_layer)
